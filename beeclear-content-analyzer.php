@@ -2,7 +2,7 @@
 /**
  * Plugin Name: BeeClear Content Analyzer
  * Plugin URI: https://beeclear.pl
- * Description: Advanced content topicality analysis for WordPress posts and pages — server-side relevance and browser-side semantic vectors, with cached reports per page/topic.
+ * Description: Content topicality analysis for WordPress posts and pages — server-side relevance + browser-side semantic vectors, with caching and reports.
  * Version: 1.3.0
  * Author: <a href="https://beeclear.pl">BeeClear</a>
  * License: GPL v2 or later
@@ -11,537 +11,270 @@
  * Requires PHP: 7.4
  */
 
-if ( ! defined( 'ABSPATH' ) ) { exit; }
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
 
-define( 'CA_VERSION', '1.3.0' );
+define( 'BCCA_VERSION', '1.3.0' );
 
-/**
- * ============================================================
- * i18n
- * ============================================================
- */
-add_action( 'plugins_loaded', function() {
+/* ============================================================
+   i18n
+   ============================================================ */
+add_action( 'plugins_loaded', function () {
 	load_plugin_textdomain( 'beeclear-content-analyzer', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
 } );
 
-/**
- * ============================================================
- * DB: Cache table (upgrade-safe)
- * ============================================================
- */
-function ca_db_create_or_update_table() {
+/* ============================================================
+   Activation: cache table
+   ============================================================ */
+register_activation_hook( __FILE__, function () {
 	global $wpdb;
-
 	$table = $wpdb->prefix . 'ca_analysis_cache';
 
-	// dbDelta can add columns if they are declared here.
 	$sql = "CREATE TABLE $table (
 		id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
 		post_id bigint(20) UNSIGNED NOT NULL,
-		analysis_key varchar(64) NOT NULL,
-		analysis_type varchar(24) NOT NULL,
-		mode varchar(16) NOT NULL,
-		focus_phrase varchar(500) DEFAULT '',
+		mode varchar(20) NOT NULL DEFAULT 'server',
+		analysis_type varchar(30) NOT NULL DEFAULT 'word',
+		phrase_hash varchar(64) NOT NULL DEFAULT '',
+		phrase_text varchar(500) NOT NULL DEFAULT '',
 		analysis_data longtext NOT NULL,
-		created_at datetime DEFAULT CURRENT_TIMESTAMP,
-		PRIMARY KEY  (id),
+		created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY (id),
 		KEY post_id (post_id),
-		KEY analysis_key (analysis_key),
-		KEY analysis_type (analysis_type),
-		KEY mode (mode)
+		KEY mode_type (mode, analysis_type),
+		KEY phrase_hash (phrase_hash)
 	) {$wpdb->get_charset_collate()};";
 
 	require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 	dbDelta( $sql );
-}
-
-register_activation_hook( __FILE__, function() {
-	ca_db_create_or_update_table();
-
-	// Init default settings.
-	if ( ! get_option( 'ca_settings', false ) ) {
-		ca_update_settings( ca_get_settings_defaults() );
-	}
 } );
 
-// Upgrade on load (safe; dbDelta no-ops when up to date).
-add_action( 'admin_init', function() {
-	if ( current_user_can( 'manage_options' ) ) {
-		ca_db_create_or_update_table();
-	}
-} );
-
-/**
- * ============================================================
- * SETTINGS (Global)
- * ============================================================
- */
-function ca_get_settings_defaults() {
+/* ============================================================
+   Settings helpers
+   ============================================================ */
+function bcca_defaults() {
 	return array(
-		'mode' => 'server', // server | browser
+		'mode'                      => 'server', // server|browser
 		'delete_data_on_deactivate' => 0,
 	);
 }
-function ca_get_settings() {
-	$defaults = ca_get_settings_defaults();
-	$opts = get_option( 'ca_settings', array() );
-	if ( ! is_array( $opts ) ) { $opts = array(); }
-	return wp_parse_args( $opts, $defaults );
+
+function bcca_get_settings() {
+	$opts = get_option( 'bcca_settings', array() );
+	if ( ! is_array( $opts ) ) {
+		$opts = array();
+	}
+	return wp_parse_args( $opts, bcca_defaults() );
 }
-function ca_update_settings( $new_opts ) {
-	$defaults = ca_get_settings_defaults();
-	$clean = array();
-	$clean['mode'] = ( isset( $new_opts['mode'] ) && in_array( $new_opts['mode'], array( 'server', 'browser' ), true ) ) ? $new_opts['mode'] : $defaults['mode'];
-	$clean['delete_data_on_deactivate'] = empty( $new_opts['delete_data_on_deactivate'] ) ? 0 : 1;
-	update_option( 'ca_settings', $clean, false );
+
+function bcca_update_settings( $new ) {
+	$clean = bcca_defaults();
+	$clean['mode'] = ( isset( $new['mode'] ) && in_array( $new['mode'], array( 'server', 'browser' ), true ) ) ? $new['mode'] : 'server';
+	$clean['delete_data_on_deactivate'] = empty( $new['delete_data_on_deactivate'] ) ? 0 : 1;
+	update_option( 'bcca_settings', $clean, false );
 	return $clean;
 }
 
-/**
- * ============================================================
- * CLEANUP
- * ============================================================
- */
-function ca_clear_all_plugin_data() {
+/* ============================================================
+   Cleanup
+   ============================================================ */
+function bcca_clear_all_data() {
 	global $wpdb;
 
-	delete_option( 'ca_settings' );
+	delete_option( 'bcca_settings' );
 
-	// Remove focus phrase post meta.
-	$wpdb->query( $wpdb->prepare(
-		"DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s",
-		'_ca_focus_phrase'
-	) );
+	// Delete focus topic meta
+	$wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$wpdb->postmeta} WHERE meta_key = %s",
+			'_ca_focus_phrase'
+		)
+	);
 
-	// Drop cache table.
+	// Drop cache table
 	$table = $wpdb->prefix . 'ca_analysis_cache';
 	$wpdb->query( "DROP TABLE IF EXISTS {$table}" );
 }
 
-register_deactivation_hook( __FILE__, function() {
-	$opts = ca_get_settings();
+register_deactivation_hook( __FILE__, function () {
+	$opts = bcca_get_settings();
 	if ( ! empty( $opts['delete_data_on_deactivate'] ) ) {
-		ca_clear_all_plugin_data();
+		bcca_clear_all_data();
 	}
 } );
 
-register_uninstall_hook( __FILE__, 'ca_clear_all_plugin_data' );
+register_uninstall_hook( __FILE__, 'bcca_clear_all_data' );
 
-/**
- * ============================================================
- * META
- * ============================================================
- */
-add_action( 'init', function() {
+/* ============================================================
+   Post meta: Focus topic (metabox)
+   ============================================================ */
+add_action( 'init', function () {
 	register_post_meta( '', '_ca_focus_phrase', array(
 		'show_in_rest'  => true,
 		'single'        => true,
 		'type'          => 'string',
-		'auth_callback' => function() { return current_user_can( 'edit_posts' ); },
+		'auth_callback' => function () {
+			return current_user_can( 'edit_posts' );
+		},
 	) );
 } );
 
-add_action( 'add_meta_boxes', function() {
+add_action( 'add_meta_boxes', function () {
 	foreach ( array( 'post', 'page' ) as $pt ) {
 		add_meta_box(
-			'ca_focus_phrase',
+			'bcca_focus_phrase',
 			esc_html__( 'Content Analyzer — Focus topic', 'beeclear-content-analyzer' ),
-			'ca_render_meta_box',
+			'bcca_render_metabox',
 			$pt,
 			'side'
 		);
 	}
 } );
 
-function ca_render_meta_box( $post ) {
+function bcca_render_metabox( $post ) {
 	$ph = get_post_meta( $post->ID, '_ca_focus_phrase', true );
-	wp_nonce_field( 'ca_save_meta', 'ca_meta_nonce' );
+	wp_nonce_field( 'bcca_save_meta', 'bcca_meta_nonce' );
 
-	echo '<p><label for="ca_focus_phrase">' . esc_html__( 'Focus topic:', 'beeclear-content-analyzer' ) . '</label>';
-	echo '<input type="text" id="ca_focus_phrase" name="ca_focus_phrase" value="' . esc_attr( $ph ) . '" style="width:100%" placeholder="' . esc_attr__( 'e.g. content marketing', 'beeclear-content-analyzer' ) . '"></p>';
-
-	echo '<p class="description">' . esc_html__( 'Used as the default topic for embedding/chunk analysis (you can override on the report page).', 'beeclear-content-analyzer' ) . '</p>';
-	echo '<p class="description">' . esc_html__( 'If empty, the plugin will try to use the first H1 as the topic.', 'beeclear-content-analyzer' ) . '</p>';
+	echo '<p><label for="bcca_focus_phrase">' . esc_html__( 'Focus phrase / topic:', 'beeclear-content-analyzer' ) . '</label></p>';
+	echo '<input type="text" id="bcca_focus_phrase" name="bcca_focus_phrase" value="' . esc_attr( $ph ) . '" style="width:100%" placeholder="e.g. content marketing" />';
+	echo '<p class="description">' . esc_html__( 'Used as the default topic for word + chunk analysis.', 'beeclear-content-analyzer' ) . '</p>';
 }
 
-add_action( 'save_post', function( $pid ) {
-	if ( ! isset( $_POST['ca_meta_nonce'] ) || ! wp_verify_nonce( $_POST['ca_meta_nonce'], 'ca_save_meta' ) ) { return; }
-	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) { return; }
-	if ( ! current_user_can( 'edit_post', $pid ) ) { return; }
-
-	if ( isset( $_POST['ca_focus_phrase'] ) ) {
-		update_post_meta( $pid, '_ca_focus_phrase', sanitize_text_field( $_POST['ca_focus_phrase'] ) );
+add_action( 'save_post', function ( $pid ) {
+	if ( ! isset( $_POST['bcca_meta_nonce'] ) || ! wp_verify_nonce( $_POST['bcca_meta_nonce'], 'bcca_save_meta' ) ) {
+		return;
+	}
+	if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+		return;
+	}
+	if ( ! current_user_can( 'edit_post', $pid ) ) {
+		return;
+	}
+	if ( isset( $_POST['bcca_focus_phrase'] ) ) {
+		update_post_meta( $pid, '_ca_focus_phrase', sanitize_text_field( $_POST['bcca_focus_phrase'] ) );
 	}
 } );
 
-/**
- * ============================================================
- * MENU
- * ============================================================
- * Menu name must be without "BeeClear": "Content Analyzer" already matches old UX.
- */
-add_action( 'admin_menu', function() {
-
+/* ============================================================
+   Menus (Global settings first) + Import/Export + Report
+   ============================================================ */
+add_action( 'admin_menu', function () {
+	// Menu label: without "BeeClear" -> "Content Analyzer" is OK for this plugin name
 	add_menu_page(
 		__( 'Content Analyzer', 'beeclear-content-analyzer' ),
 		__( 'Content Analyzer', 'beeclear-content-analyzer' ),
 		'edit_posts',
-		'content-analyzer',
-		'ca_render_list_page',
+		'bcca-content-analyzer',
+		'bcca_render_list_page',
 		'dashicons-chart-bar',
 		30
 	);
 
-	// Global settings (first).
+	// Global settings FIRST
 	add_submenu_page(
-		'content-analyzer',
+		'bcca-content-analyzer',
 		__( 'Global settings', 'beeclear-content-analyzer' ),
 		__( 'Global settings', 'beeclear-content-analyzer' ),
 		'manage_options',
-		'ca-global-settings',
-		'ca_render_global_settings_page'
+		'bcca-global-settings',
+		'bcca_render_global_settings_page'
 	);
 
-	// List page (kept as existing slug).
+	// List (Analyzer)
 	add_submenu_page(
-		'content-analyzer',
+		'bcca-content-analyzer',
 		__( 'Analyzer', 'beeclear-content-analyzer' ),
 		__( 'Analyzer', 'beeclear-content-analyzer' ),
 		'edit_posts',
-		'content-analyzer',
-		'ca_render_list_page'
+		'bcca-content-analyzer',
+		'bcca_render_list_page'
 	);
 
-	// Report page (hidden from menu; opened from list).
+	// Import/Export
+	add_submenu_page(
+		'bcca-content-analyzer',
+		__( 'Import/Export', 'beeclear-content-analyzer' ),
+		__( 'Import/Export', 'beeclear-content-analyzer' ),
+		'manage_options',
+		'bcca-import-export',
+		'bcca_render_import_export_page'
+	);
+
+	// Hidden report page (accessed via link)
 	add_submenu_page(
 		null,
-		__( 'Report', 'beeclear-content-analyzer' ),
-		__( 'Report', 'beeclear-content-analyzer' ),
+		__( 'Content report', 'beeclear-content-analyzer' ),
+		__( 'Content report', 'beeclear-content-analyzer' ),
 		'edit_posts',
-		'content-analyzer-report',
-		'ca_render_report_page'
-	);
-
-	// Import / Export.
-	add_submenu_page(
-		'content-analyzer',
-		__( 'Import/Export', 'beeclear-content-analyzer' ),
-		__( 'Import/Export', 'beeclear-content-analyzer' ),
-		'manage_options',
-		'ca-import-export',
-		'ca_render_import_export_page'
+		'bcca-report',
+		'bcca_render_report_page'
 	);
 } );
 
-// Settings link in plugins list (first)
-add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function( $links ) {
-	$settings_link = '<a href="' . esc_url( admin_url( 'admin.php?page=ca-global-settings' ) ) . '">' . esc_html__( 'Settings', 'beeclear-content-analyzer' ) . '</a>';
-	array_unshift( $links, $settings_link );
+// Settings link on Plugins list (FIRST)
+add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function ( $links ) {
+	$settings = '<a href="' . esc_url( admin_url( 'admin.php?page=bcca-global-settings' ) ) . '">' . esc_html__( 'Settings', 'beeclear-content-analyzer' ) . '</a>';
+	array_unshift( $links, $settings );
 	return $links;
 } );
 
-/**
- * ============================================================
- * ADMIN ASSETS
- * ============================================================
- */
-add_action( 'admin_enqueue_scripts', function( $hook ) {
+/* ============================================================
+   Admin assets
+   ============================================================ */
+add_action( 'admin_enqueue_scripts', function ( $hook ) {
 	$allowed = array(
-		'toplevel_page_content-analyzer',
-		'content-analyzer_page_ca-global-settings',
-		'content-analyzer_page_ca-import-export',
-		'admin_page_content-analyzer-report',
+		'toplevel_page_bcca-content-analyzer',
+		'bcca-content-analyzer_page_bcca-global-settings',
+		'bcca-content-analyzer_page_bcca-import-export',
 	);
-	if ( ! in_array( $hook, $allowed, true ) ) { return; }
+
+	// Report page hook varies; easiest: enqueue when page=bcca-report
+	if ( isset( $_GET['page'] ) && $_GET['page'] === 'bcca-report' ) {
+		$allowed[] = $hook;
+	}
+
+	if ( ! in_array( $hook, $allowed, true ) && ( empty( $_GET['page'] ) || $_GET['page'] !== 'bcca-report' ) ) {
+		return;
+	}
 
 	wp_enqueue_script( 'jquery' );
-	wp_enqueue_style( 'dashicons' );
 
-	$opts = ca_get_settings();
+	$opts = bcca_get_settings();
 	$data = array(
 		'ajaxUrl' => admin_url( 'admin-ajax.php' ),
-		'nonce'   => wp_create_nonce( 'ca_nonce' ),
+		'nonce'   => wp_create_nonce( 'bcca_nonce' ),
 		'mode'    => $opts['mode'],
 	);
-	wp_add_inline_script( 'jquery', 'var caData=' . wp_json_encode( $data ) . ';', 'before' );
+	wp_add_inline_script( 'jquery', 'window.bccaData=' . wp_json_encode( $data ) . ';', 'before' );
 } );
 
-/**
- * ============================================================
- * TEXT HELPERS (Stopwords / TF / Cosine / Extractors)
- * ============================================================
- */
-function ca_get_stop_words() {
-	return array(
-		'i','w','na','z','do','nie','się','to','jest','że','o','jak','ale','za','co','od','po','tak','jej','jego','te','ten','ta','tym','tego','tej','tych',
-		'był','była','było','były','być','może','ich','go','mu','mi','ci','nam','was','im','ją','je','nas','ze','są','by','już','tylko','też','ma','czy',
-		'więc','dla','gdy','przed','przez','przy','bez','pod','nad','między','ku','lub','albo','oraz','a','u','we','tu','tam','raz','no','ani','bo','pan','pani',
-		'jako','sobie','który','która','które','których','którym','którą','czym','gdzie','kiedy','bardzo','będzie','można','mnie','mają','każdy','inne','innych',
-		'jednak','jeszcze','teraz','tutaj','wtedy','zawsze','nigdy','często','czasem','potem','ponieważ','więcej','mniej','dużo','mało','każda','każde','tę','tą',
-
-		'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be','been','being','have','has','had','do','does',
-		'did','will','would','shall','should','may','might','can','could','this','that','these','those','it','its','he','she','they','we','you','me','him','her','us','them',
-		'my','your','his','our','their','not','no','so','if','then','than','too','very','just','about','up','out','all','also'
-	);
-}
-
-function ca_build_tf_vector( $text ) {
-	$text = mb_strtolower( (string) $text );
-	$words = preg_split( '/[^\p{L}\p{N}\-]+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
-
-	$stop = ca_get_stop_words();
-	$tf = array();
-	$total = 0;
-
-	foreach ( $words as $w ) {
-		$w = trim( $w, '-' );
-		if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) { continue; }
-		if ( ! isset( $tf[ $w ] ) ) { $tf[ $w ] = 0; }
-		$tf[ $w ]++;
-		$total++;
-	}
-	if ( $total > 0 ) {
-		foreach ( $tf as $t => $c ) { $tf[ $t ] = $c / $total; }
-	}
-	return $tf;
-}
-
-function ca_cosine_similarity( $va, $vb ) {
-	$terms = array_unique( array_merge( array_keys( $va ), array_keys( $vb ) ) );
-	$dot = 0.0; $ma = 0.0; $mb = 0.0;
-
-	foreach ( $terms as $t ) {
-		$a = $va[ $t ] ?? 0.0;
-		$b = $vb[ $t ] ?? 0.0;
-		$dot += $a * $b;
-		$ma  += $a * $a;
-		$mb  += $b * $b;
-	}
-	$ma = sqrt( $ma ); $mb = sqrt( $mb );
-	return ( $ma == 0 || $mb == 0 ) ? 0.0 : round( $dot / ( $ma * $mb ), 4 );
-}
-
-function ca_extract_entities( $text ) {
-	$text = mb_strtolower( (string) $text );
-	$text = preg_replace( '/\b\d+\b/', '', $text );
-
-	$words = preg_split( '/[^\p{L}\p{N}\-]+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
-	$stop = ca_get_stop_words();
-	$freq = array();
-	$valid = 0;
-
-	foreach ( $words as $w ) {
-		$w = trim( $w, '-' );
-		if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) { continue; }
-		if ( ! isset( $freq[ $w ] ) ) { $freq[ $w ] = 0; }
-		$freq[ $w ]++;
-		$valid++;
-	}
-	arsort( $freq );
-	$ent = array();
-	foreach ( $freq as $term => $count ) {
-		$ent[] = array(
-			'term'      => $term,
-			'count'     => $count,
-			'frequency' => $valid > 0 ? round( $count / $valid * 100, 2 ) : 0,
-		);
-	}
-	return array_slice( $ent, 0, 150 );
-}
-
-function ca_extract_headings( $content ) {
-	$h = array( 'h1'=>array(),'h2'=>array(),'h3'=>array(),'h4'=>array(),'h5'=>array(),'h6'=>array(),'total'=>0 );
-	for ( $i = 1; $i <= 6; $i++ ) {
-		preg_match_all( '/<h'.$i.'[^>]*>(.*?)<\/h'.$i.'>/si', (string) $content, $m );
-		if ( ! empty( $m[1] ) ) {
-			foreach ( $m[1] as $x ) { $h[ 'h'.$i ][] = wp_strip_all_tags( $x ); }
-			$h['total'] += count( $m[1] );
-		}
-	}
-	return $h;
-}
-
-function ca_get_first_h1_text( $content ) {
-	preg_match( '/<h1[^>]*>(.*?)<\/h1>/si', (string) $content, $m );
-	if ( ! empty( $m[1] ) ) {
-		return trim( wp_strip_all_tags( $m[1] ) );
-	}
-	return '';
-}
-
-function ca_count_paragraphs( $content ) {
-	$content = wpautop( (string) $content );
-	preg_match_all( '/<p[^>]*>(.*?)<\/p>/si', $content, $m );
-	$c = 0;
-	if ( ! empty( $m[1] ) ) {
-		foreach ( $m[1] as $p ) {
-			if ( trim( wp_strip_all_tags( $p ) ) !== '' ) { $c++; }
-		}
-	}
-	return $c;
-}
-
-function ca_extract_chunks( $content ) {
-	$content = wpautop( (string) $content );
-	preg_match_all( '/<p[^>]*>(.*?)<\/p>/si', $content, $m );
-
-	$chunks = array();
-	$idx = 0;
-	if ( ! empty( $m[1] ) ) {
-		foreach ( $m[1] as $p ) {
-			$t = trim( wp_strip_all_tags( $p ) );
-			$t = html_entity_decode( $t, ENT_QUOTES, 'UTF-8' );
-			if ( ! empty( $t ) && mb_strlen( $t ) > 15 ) {
-				$w = preg_split( '/\s+/', $t, -1, PREG_SPLIT_NO_EMPTY );
-				$chunks[] = array(
-					'index'      => $idx,
-					'text'       => $t,
-					'word_count' => is_array( $w ) ? count( $w ) : 0,
-					'char_count' => mb_strlen( $t ),
-				);
-				$idx++;
-			}
-		}
-	}
-	return $chunks;
-}
-
-function ca_get_plain_text( $post ) {
-	$t = wp_strip_all_tags( (string) ( $post->post_content ?? '' ) );
-	$t = html_entity_decode( $t, ENT_QUOTES, 'UTF-8' );
-	return preg_replace( '/\s+/', ' ', trim( $t ) );
-}
-
-function ca_build_context_vector( $text_lower, $target, $all_words ) {
-	$stop = ca_get_stop_words();
-	$window = 5;
-	$ctx = array();
-	$total = 0;
-	$pos = array();
-
-	foreach ( $all_words as $i => $w ) {
-		$w = trim( (string) $w, '-' );
-		if ( $w === $target ) { $pos[] = $i; }
-	}
-	foreach ( $pos as $p ) {
-		for ( $j = max( 0, $p - $window ); $j <= min( count( $all_words ) - 1, $p + $window ); $j++ ) {
-			if ( $j === $p ) { continue; }
-			$w = trim( (string) $all_words[ $j ], '-' );
-			if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) { continue; }
-			if ( ! isset( $ctx[ $w ] ) ) { $ctx[ $w ] = 0; }
-			$ctx[ $w ]++;
-			$total++;
-		}
-	}
-	if ( $total > 0 ) {
-		foreach ( $ctx as $t => $c ) { $ctx[ $t ] = $c / $total; }
-	}
-	return $ctx;
-}
-
-function ca_get_effective_topic_for_post( $post, $override_phrase = '' ) {
-	$override_phrase = trim( (string) $override_phrase );
-	if ( $override_phrase !== '' ) { return $override_phrase; }
-
-	$meta = trim( (string) get_post_meta( $post->ID, '_ca_focus_phrase', true ) );
-	if ( $meta !== '' ) { return $meta; }
-
-	$h1 = trim( (string) ca_get_first_h1_text( $post->post_content ) );
-	if ( $h1 !== '' ) { return $h1; }
-
-	// Final fallback: title.
-	return trim( (string) $post->post_title );
-}
-
-/**
- * ============================================================
- * CACHE HELPERS
- * ============================================================
- */
-function ca_make_analysis_key( $post_id, $mode, $type, $phrase ) {
-	return sha1( (string) $post_id . '|' . (string) $mode . '|' . (string) $type . '|' . trim( (string) $phrase ) );
-}
-
-function ca_cache_get( $post_id, $mode, $type, $phrase ) {
-	global $wpdb;
-	$table = $wpdb->prefix . 'ca_analysis_cache';
-	$key = ca_make_analysis_key( $post_id, $mode, $type, $phrase );
-
-	$row = $wpdb->get_row(
-		$wpdb->prepare(
-			"SELECT * FROM {$table} WHERE post_id = %d AND analysis_key = %s AND analysis_type = %s AND mode = %s ORDER BY id DESC LIMIT 1",
-			$post_id, $key, $type, $mode
-		),
-		ARRAY_A
-	);
-
-	if ( ! $row ) { return null; }
-
-	$data = json_decode( (string) $row['analysis_data'], true );
-	if ( ! is_array( $data ) ) { $data = null; }
-
-	return array(
-		'created_at' => $row['created_at'],
-		'focus_phrase' => (string) $row['focus_phrase'],
-		'data' => $data,
-	);
-}
-
-function ca_cache_set( $post_id, $mode, $type, $phrase, $analysis_data ) {
-	global $wpdb;
-	$table = $wpdb->prefix . 'ca_analysis_cache';
-	$key = ca_make_analysis_key( $post_id, $mode, $type, $phrase );
-
-	$wpdb->insert(
-		$table,
-		array(
-			'post_id'       => (int) $post_id,
-			'analysis_key'  => $key,
-			'analysis_type' => (string) $type,
-			'mode'          => (string) $mode,
-			'focus_phrase'  => (string) $phrase,
-			'analysis_data' => wp_json_encode( $analysis_data, JSON_UNESCAPED_UNICODE ),
-			'created_at'    => current_time( 'mysql' ),
-		),
-		array( '%d','%s','%s','%s','%s','%s','%s' )
-	);
-}
-
-function ca_cache_delete_for_post( $post_id ) {
-	global $wpdb;
-	$table = $wpdb->prefix . 'ca_analysis_cache';
-	$wpdb->query( $wpdb->prepare( "DELETE FROM {$table} WHERE post_id = %d", (int) $post_id ) );
-}
-
-/**
- * ============================================================
- * GLOBAL SETTINGS PAGE
- * ============================================================
- */
-function ca_render_global_settings_page() {
+/* ============================================================
+   Global Settings page
+   ============================================================ */
+function bcca_render_global_settings_page() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		wp_die( esc_html__( 'You do not have permission to access this page.', 'beeclear-content-analyzer' ) );
 	}
 
-	$opts = ca_get_settings();
+	$opts = bcca_get_settings();
 
-	if ( isset( $_POST['ca_settings_submit'] ) ) {
-		check_admin_referer( 'ca_save_settings', 'ca_settings_nonce' );
-
-		$new_opts = array(
-			'mode' => sanitize_text_field( $_POST['ca_mode'] ?? '' ),
-			'delete_data_on_deactivate' => ! empty( $_POST['ca_delete_data_on_deactivate'] ) ? 1 : 0,
-		);
-		$opts = ca_update_settings( $new_opts );
+	if ( isset( $_POST['bcca_save_settings'] ) ) {
+		check_admin_referer( 'bcca_save_settings', 'bcca_settings_nonce' );
+		$opts = bcca_update_settings( array(
+			'mode'                      => sanitize_text_field( $_POST['bcca_mode'] ?? '' ),
+			'delete_data_on_deactivate' => ! empty( $_POST['bcca_delete_data_on_deactivate'] ) ? 1 : 0,
+		) );
 		echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Settings saved.', 'beeclear-content-analyzer' ) . '</p></div>';
 	}
 
-	if ( isset( $_POST['ca_clear_data_submit'] ) ) {
-		check_admin_referer( 'ca_clear_data', 'ca_clear_data_nonce' );
-		ca_clear_all_plugin_data();
-		ca_update_settings( ca_get_settings_defaults() );
+	if ( isset( $_POST['bcca_clear_data'] ) ) {
+		check_admin_referer( 'bcca_clear_data', 'bcca_clear_nonce' );
+		bcca_clear_all_data();
+		// restore defaults so plugin continues to work
+		bcca_update_settings( bcca_defaults() );
+		$opts = bcca_get_settings();
 		echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__( 'Plugin data cleared.', 'beeclear-content-analyzer' ) . '</p></div>';
-		$opts = ca_get_settings();
 	}
 
 	?>
@@ -549,17 +282,23 @@ function ca_render_global_settings_page() {
 		<h1><?php echo esc_html__( 'Global settings', 'beeclear-content-analyzer' ); ?></h1>
 
 		<form method="post" style="max-width: 1100px;">
-			<?php wp_nonce_field( 'ca_save_settings', 'ca_settings_nonce' ); ?>
+			<?php wp_nonce_field( 'bcca_save_settings', 'bcca_settings_nonce' ); ?>
 
 			<table class="form-table" role="presentation">
 				<tr>
-					<th scope="row"><label for="ca_mode"><?php echo esc_html__( 'Analysis mode', 'beeclear-content-analyzer' ); ?></label></th>
+					<th scope="row"><label for="bcca_mode"><?php echo esc_html__( 'Analysis mode', 'beeclear-content-analyzer' ); ?></label></th>
 					<td>
-						<select id="ca_mode" name="ca_mode">
-							<option value="server" <?php selected( $opts['mode'], 'server' ); ?>><?php echo esc_html__( 'Server (PHP)', 'beeclear-content-analyzer' ); ?></option>
-							<option value="browser" <?php selected( $opts['mode'], 'browser' ); ?>><?php echo esc_html__( 'Browser (client-side)', 'beeclear-content-analyzer' ); ?></option>
+						<select id="bcca_mode" name="bcca_mode">
+							<option value="server" <?php selected( $opts['mode'], 'server' ); ?>>
+								<?php echo esc_html__( 'Server (PHP)', 'beeclear-content-analyzer' ); ?>
+							</option>
+							<option value="browser" <?php selected( $opts['mode'], 'browser' ); ?>>
+								<?php echo esc_html__( 'Browser (client-side)', 'beeclear-content-analyzer' ); ?>
+							</option>
 						</select>
-						<p class="description"><?php echo esc_html__( 'Server mode runs analysis in PHP. Browser mode computes vectors in your browser (no external services).', 'beeclear-content-analyzer' ); ?></p>
+						<p class="description">
+							<?php echo esc_html__( 'Server mode runs in PHP. Browser mode computes semantic vectors in your browser (no external services).', 'beeclear-content-analyzer' ); ?>
+						</p>
 					</td>
 				</tr>
 
@@ -567,48 +306,50 @@ function ca_render_global_settings_page() {
 					<th scope="row"><?php echo esc_html__( 'Data handling', 'beeclear-content-analyzer' ); ?></th>
 					<td>
 						<label>
-							<input type="checkbox" name="ca_delete_data_on_deactivate" value="1" <?php checked( ! empty( $opts['delete_data_on_deactivate'] ) ); ?> />
+							<input type="checkbox" name="bcca_delete_data_on_deactivate" value="1" <?php checked( ! empty( $opts['delete_data_on_deactivate'] ) ); ?> />
 							<?php echo esc_html__( 'Delete plugin data on deactivation', 'beeclear-content-analyzer' ); ?>
 						</label>
-						<p class="description"><?php echo esc_html__( 'If enabled, plugin settings, focus phrase meta and cache table will be removed when you deactivate the plugin.', 'beeclear-content-analyzer' ); ?></p>
+						<p class="description">
+							<?php echo esc_html__( 'Removes settings, focus topic meta, and cache table when you deactivate the plugin.', 'beeclear-content-analyzer' ); ?>
+						</p>
 					</td>
 				</tr>
 			</table>
 
-			<?php submit_button( esc_html__( 'Save settings', 'beeclear-content-analyzer' ), 'primary', 'ca_settings_submit' ); ?>
+			<?php submit_button( esc_html__( 'Save settings', 'beeclear-content-analyzer' ), 'primary', 'bcca_save_settings' ); ?>
 		</form>
 
 		<hr />
 
 		<form method="post" style="max-width: 1100px;">
-			<?php wp_nonce_field( 'ca_clear_data', 'ca_clear_data_nonce' ); ?>
+			<?php wp_nonce_field( 'bcca_clear_data', 'bcca_clear_nonce' ); ?>
 			<h2><?php echo esc_html__( 'Clear data', 'beeclear-content-analyzer' ); ?></h2>
-			<p><?php echo esc_html__( 'This will remove plugin settings, focus phrase meta, and the cache table. Use with caution.', 'beeclear-content-analyzer' ); ?></p>
-			<?php submit_button( esc_html__( 'Clear plugin data', 'beeclear-content-analyzer' ), 'delete', 'ca_clear_data_submit' ); ?>
+			<p><?php echo esc_html__( 'This removes plugin settings, focus topic meta, and the cache table. Use with caution.', 'beeclear-content-analyzer' ); ?></p>
+			<?php submit_button( esc_html__( 'Clear plugin data', 'beeclear-content-analyzer' ), 'delete', 'bcca_clear_data' ); ?>
 		</form>
 	</div>
 	<?php
 }
 
-/**
- * ============================================================
- * IMPORT / EXPORT PAGE
- * ============================================================
- */
-function ca_render_import_export_page() {
+/* ============================================================
+   Import/Export
+   ============================================================ */
+function bcca_render_import_export_page() {
 	if ( ! current_user_can( 'manage_options' ) ) {
 		wp_die( esc_html__( 'You do not have permission to access this page.', 'beeclear-content-analyzer' ) );
 	}
 
 	// Export
-	if ( isset( $_POST['ca_export_submit'] ) ) {
-		check_admin_referer( 'ca_export_settings', 'ca_export_nonce' );
+	if ( isset( $_POST['bcca_export'] ) ) {
+		check_admin_referer( 'bcca_export', 'bcca_export_nonce' );
+
 		$payload = array(
 			'exported_at' => gmdate( 'c' ),
 			'plugin'      => 'beeclear-content-analyzer',
-			'version'     => CA_VERSION,
-			'settings'    => ca_get_settings(),
+			'version'     => BCCA_VERSION,
+			'settings'    => bcca_get_settings(),
 		);
+
 		nocache_headers();
 		header( 'Content-Type: application/json; charset=utf-8' );
 		header( 'Content-Disposition: attachment; filename=beeclear-content-analyzer-export.json' );
@@ -617,17 +358,19 @@ function ca_render_import_export_page() {
 	}
 
 	// Import
-	if ( isset( $_POST['ca_import_submit'] ) ) {
-		check_admin_referer( 'ca_import_settings', 'ca_import_nonce' );
-		if ( empty( $_FILES['ca_import_file']['tmp_name'] ) ) {
-			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__( 'Please choose a JSON file to import.', 'beeclear-content-analyzer' ) . '</p></div>';
+	if ( isset( $_POST['bcca_import'] ) ) {
+		check_admin_referer( 'bcca_import', 'bcca_import_nonce' );
+
+		if ( empty( $_FILES['bcca_import_file']['tmp_name'] ) ) {
+			echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__( 'Please choose a JSON file.', 'beeclear-content-analyzer' ) . '</p></div>';
 		} else {
-			$raw = file_get_contents( $_FILES['ca_import_file']['tmp_name'] );
-			$json = json_decode( (string) $raw, true );
+			$raw  = file_get_contents( $_FILES['bcca_import_file']['tmp_name'] );
+			$json = json_decode( $raw, true );
+
 			if ( ! is_array( $json ) || empty( $json['settings'] ) || ! is_array( $json['settings'] ) ) {
 				echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__( 'Invalid import file.', 'beeclear-content-analyzer' ) . '</p></div>';
 			} else {
-				ca_update_settings( $json['settings'] );
+				bcca_update_settings( $json['settings'] );
 				echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Import completed.', 'beeclear-content-analyzer' ) . '</p></div>';
 			}
 		}
@@ -637,36 +380,310 @@ function ca_render_import_export_page() {
 	<div class="wrap">
 		<h1><?php echo esc_html__( 'Import/Export', 'beeclear-content-analyzer' ); ?></h1>
 
-		<div style="max-width: 1100px;">
+		<div style="max-width:1100px;">
 			<h2><?php echo esc_html__( 'Export', 'beeclear-content-analyzer' ); ?></h2>
-			<p><?php echo esc_html__( 'Download a JSON file with plugin configuration.', 'beeclear-content-analyzer' ); ?></p>
 			<form method="post">
-				<?php wp_nonce_field( 'ca_export_settings', 'ca_export_nonce' ); ?>
-				<?php submit_button( esc_html__( 'Export settings', 'beeclear-content-analyzer' ), 'secondary', 'ca_export_submit' ); ?>
+				<?php wp_nonce_field( 'bcca_export', 'bcca_export_nonce' ); ?>
+				<?php submit_button( esc_html__( 'Export settings', 'beeclear-content-analyzer' ), 'secondary', 'bcca_export' ); ?>
 			</form>
 
 			<hr />
 
 			<h2><?php echo esc_html__( 'Import', 'beeclear-content-analyzer' ); ?></h2>
-			<p><?php echo esc_html__( 'Import plugin configuration from a JSON export file.', 'beeclear-content-analyzer' ); ?></p>
 			<form method="post" enctype="multipart/form-data">
-				<?php wp_nonce_field( 'ca_import_settings', 'ca_import_nonce' ); ?>
-				<input type="file" name="ca_import_file" accept="application/json" />
-				<?php submit_button( esc_html__( 'Import settings', 'beeclear-content-analyzer' ), 'primary', 'ca_import_submit' ); ?>
+				<?php wp_nonce_field( 'bcca_import', 'bcca_import_nonce' ); ?>
+				<input type="file" name="bcca_import_file" accept="application/json" />
+				<?php submit_button( esc_html__( 'Import settings', 'beeclear-content-analyzer' ), 'primary', 'bcca_import' ); ?>
 			</form>
 		</div>
 	</div>
 	<?php
 }
 
-/**
- * ============================================================
- * AJAX: LIST DATA (includes heading counts)
- * ============================================================
- */
-add_action( 'wp_ajax_ca_get_posts_list', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+/* ============================================================
+   Text extraction helpers
+   ============================================================ */
+function bcca_plain_text_from_post( $post ) {
+	$text = wp_strip_all_tags( $post->post_content );
+	$text = html_entity_decode( $text, ENT_QUOTES, 'UTF-8' );
+	$text = preg_replace( '/\s+/u', ' ', trim( $text ) );
+	return $text;
+}
+
+function bcca_extract_headings( $html ) {
+	$out = array(
+		'h1' => array(), 'h2' => array(), 'h3' => array(), 'h4' => array(), 'h5' => array(), 'h6' => array(),
+		'total' => 0,
+	);
+
+	for ( $i = 1; $i <= 6; $i++ ) {
+		preg_match_all( '/<h' . $i . '[^>]*>(.*?)<\/h' . $i . '>/si', (string) $html, $m );
+		if ( ! empty( $m[1] ) ) {
+			foreach ( $m[1] as $h ) {
+				$out[ 'h' . $i ][] = trim( wp_strip_all_tags( $h ) );
+			}
+			$out['total'] += count( $m[1] );
+		}
+	}
+	return $out;
+}
+
+function bcca_count_paragraphs( $html ) {
+	$html = wpautop( (string) $html );
+	preg_match_all( '/<p[^>]*>(.*?)<\/p>/si', $html, $m );
+	$c = 0;
+	if ( ! empty( $m[1] ) ) {
+		foreach ( $m[1] as $p ) {
+			if ( trim( wp_strip_all_tags( $p ) ) !== '' ) {
+				$c++;
+			}
+		}
+	}
+	return $c;
+}
+
+function bcca_extract_chunks( $html ) {
+	$html = wpautop( (string) $html );
+	preg_match_all( '/<p[^>]*>(.*?)<\/p>/si', $html, $m );
+	$chunks = array();
+	$idx    = 0;
+
+	if ( ! empty( $m[1] ) ) {
+		foreach ( $m[1] as $p ) {
+			$t = trim( wp_strip_all_tags( $p ) );
+			$t = html_entity_decode( $t, ENT_QUOTES, 'UTF-8' );
+			if ( $t !== '' && mb_strlen( $t ) > 15 ) {
+				$words = preg_split( '/\s+/u', $t, -1, PREG_SPLIT_NO_EMPTY );
+				$chunks[] = array(
+					'index'      => $idx,
+					'text'       => $t,
+					'word_count' => is_array( $words ) ? count( $words ) : 0,
+					'char_count' => mb_strlen( $t ),
+				);
+				$idx++;
+			}
+		}
+	}
+
+	return $chunks;
+}
+
+/* ============================================================
+   Topic selection rules:
+   - meta _ca_focus_phrase
+   - else first H1
+   - else post title
+   ============================================================ */
+function bcca_default_topic_for_post( $post ) {
+	$meta = trim( (string) get_post_meta( $post->ID, '_ca_focus_phrase', true ) );
+	if ( $meta !== '' ) {
+		return $meta;
+	}
+
+	$headings = bcca_extract_headings( $post->post_content );
+	if ( ! empty( $headings['h1'][0] ) ) {
+		return trim( (string) $headings['h1'][0] );
+	}
+
+	return trim( (string) $post->post_title );
+}
+
+/* ============================================================
+   Cache helpers
+   ============================================================ */
+function bcca_phrase_hash( $phrase ) {
+	$phrase = trim( (string) $phrase );
+	$phrase = mb_strtolower( $phrase );
+	return hash( 'sha256', $phrase );
+}
+
+function bcca_cache_get( $post_id, $mode, $analysis_type, $phrase ) {
+	global $wpdb;
+	$table = $wpdb->prefix . 'ca_analysis_cache';
+
+	$hash = bcca_phrase_hash( $phrase );
+
+	$row = $wpdb->get_row(
+		$wpdb->prepare(
+			"SELECT * FROM {$table}
+			 WHERE post_id=%d AND mode=%s AND analysis_type=%s AND phrase_hash=%s
+			 ORDER BY created_at DESC LIMIT 1",
+			$post_id, $mode, $analysis_type, $hash
+		),
+		ARRAY_A
+	);
+
+	if ( ! $row ) {
+		return null;
+	}
+
+	$data = json_decode( (string) $row['analysis_data'], true );
+	if ( ! is_array( $data ) ) {
+		return null;
+	}
+
+	return array(
+		'created_at'  => $row['created_at'],
+		'phrase_text' => $row['phrase_text'],
+		'data'        => $data,
+	);
+}
+
+function bcca_cache_save( $post_id, $mode, $analysis_type, $phrase, $data ) {
+	global $wpdb;
+	$table = $wpdb->prefix . 'ca_analysis_cache';
+
+	$hash  = bcca_phrase_hash( $phrase );
+	$ptxt  = mb_substr( trim( (string) $phrase ), 0, 500 );
+	$json  = wp_json_encode( $data, JSON_UNESCAPED_UNICODE );
+
+	if ( ! $json ) {
+		return false;
+	}
+
+	$ins = $wpdb->insert(
+		$table,
+		array(
+			'post_id'       => (int) $post_id,
+			'mode'          => (string) $mode,
+			'analysis_type' => (string) $analysis_type,
+			'phrase_hash'   => (string) $hash,
+			'phrase_text'   => (string) $ptxt,
+			'analysis_data' => (string) $json,
+			'created_at'    => current_time( 'mysql' ),
+		),
+		array( '%d', '%s', '%s', '%s', '%s', '%s', '%s' )
+	);
+
+	return (bool) $ins;
+}
+
+/* ============================================================
+   Server-side "embedding-like" helpers (TF + context cosine)
+   ============================================================ */
+function bcca_stop_words() {
+	// minimal but useful stop list (PL+EN)
+	return array(
+		'i','w','na','z','do','nie','się','to','jest','że','o','jak','ale','za','co','od','po','tak','jej','jego',
+		'ten','ta','tym','tego','tej','tych','był','była','było','były','być','może','ich','go','mu','mi','ci','nam',
+		'was','im','ją','je','nas','ze','są','by','już','tylko','też','ma','czy','więc','dla','gdy','przed','przez',
+		'przy','bez','pod','nad','między','ku','lub','albo','oraz','a','u','we','tu','tam','raz','no','ani','bo',
+		'jako','sobie','który','która','które','których','którym','którą','czym','gdzie','kiedy','bardzo','będzie',
+		'można','mnie','mają','każdy','inne','innych','jednak','jeszcze','teraz','zawsze','nigdy','często','czasem',
+		'ponieważ','więcej','mniej','dużo','mało',
+		'the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','is','are','was','were','be',
+		'been','being','have','has','had','do','does','did','will','would','shall','should','may','might','can','could',
+		'this','that','these','those','it','its','he','she','they','we','you','me','him','her','us','them','my','your',
+		'his','our','their','not','no','so','if','then','than','too','very','just','about','up','out','all','also'
+	);
+}
+
+function bcca_tf_vector( $text ) {
+	$text  = mb_strtolower( (string) $text );
+	$words = preg_split( '/[^\p{L}\p{N}\-]+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
+	$stop  = bcca_stop_words();
+
+	$tf    = array();
+	$total = 0;
+
+	if ( is_array( $words ) ) {
+		foreach ( $words as $w ) {
+			$w = trim( $w, '-' );
+			if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) {
+				continue;
+			}
+			if ( ! isset( $tf[ $w ] ) ) {
+				$tf[ $w ] = 0;
+			}
+			$tf[ $w ]++;
+			$total++;
+		}
+	}
+
+	if ( $total > 0 ) {
+		foreach ( $tf as $t => $c ) {
+			$tf[ $t ] = $c / $total;
+		}
+	}
+
+	return $tf;
+}
+
+function bcca_cosine( $a, $b ) {
+	$terms = array_unique( array_merge( array_keys( $a ), array_keys( $b ) ) );
+	$dot = 0.0; $ma = 0.0; $mb = 0.0;
+
+	foreach ( $terms as $t ) {
+		$x = $a[ $t ] ?? 0.0;
+		$y = $b[ $t ] ?? 0.0;
+		$dot += $x * $y;
+		$ma  += $x * $x;
+		$mb  += $y * $y;
+	}
+
+	$ma = sqrt( $ma );
+	$mb = sqrt( $mb );
+
+	if ( $ma == 0.0 || $mb == 0.0 ) {
+		return 0.0;
+	}
+
+	return $dot / ( $ma * $mb );
+}
+
+function bcca_context_vector( $all_words, $target, $window = 5 ) {
+	$stop = bcca_stop_words();
+	$ctx  = array();
+	$total = 0;
+
+	$positions = array();
+	foreach ( $all_words as $i => $w ) {
+		$w = trim( $w, '-' );
+		if ( $w === $target ) {
+			$positions[] = $i;
+		}
+	}
+
+	foreach ( $positions as $p ) {
+		$start = max( 0, $p - $window );
+		$end   = min( count( $all_words ) - 1, $p + $window );
+		for ( $j = $start; $j <= $end; $j++ ) {
+			if ( $j === $p ) {
+				continue;
+			}
+			$w = trim( $all_words[ $j ], '-' );
+			if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) {
+				continue;
+			}
+			if ( ! isset( $ctx[ $w ] ) ) {
+				$ctx[ $w ] = 0;
+			}
+			$ctx[ $w ]++;
+			$total++;
+		}
+		// hard cap for performance
+		if ( $total > 1500 ) {
+			break;
+		}
+	}
+
+	if ( $total > 0 ) {
+		foreach ( $ctx as $t => $c ) {
+			$ctx[ $t ] = $c / $total;
+		}
+	}
+
+	return $ctx;
+}
+
+/* ============================================================
+   AJAX: List data
+   ============================================================ */
+add_action( 'wp_ajax_bcca_get_posts_list', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
 	$posts = get_posts( array(
 		'post_type'      => array( 'post', 'page' ),
@@ -676,138 +693,124 @@ add_action( 'wp_ajax_ca_get_posts_list', function() {
 		'order'          => 'DESC',
 	) );
 
-	$r = array();
+	$out = array();
+
 	foreach ( $posts as $p ) {
-		$text  = ca_get_plain_text( $p );
-		$words = preg_split( '/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY );
-		$hdg   = ca_extract_headings( $p->post_content );
+		$text    = bcca_plain_text_from_post( $p );
+		$words   = preg_split( '/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
+		$wcount  = is_array( $words ) ? count( $words ) : 0;
+		$ccount  = mb_strlen( $text );
+		$head    = bcca_extract_headings( $p->post_content );
 
 		$cats = array();
 		if ( $p->post_type === 'post' ) {
 			$c = get_the_category( $p->ID );
-			if ( $c ) { foreach ( $c as $cat ) { $cats[] = $cat->name; } }
+			if ( $c ) {
+				foreach ( $c as $cat ) {
+					$cats[] = $cat->name;
+				}
+			}
 		}
 
-		$focus = trim( (string) get_post_meta( $p->ID, '_ca_focus_phrase', true ) );
-		$h1    = ca_get_first_h1_text( $p->post_content );
-		$default_topic = $focus !== '' ? $focus : ( $h1 !== '' ? $h1 : $p->post_title );
-
-		$r[] = array(
-			'post_id'         => $p->ID,
-			'title'           => $p->post_title,
-			'post_type'       => $p->post_type,
-			'post_status'     => $p->post_status,
-			'slug'            => $p->post_name,
-			'url'             => get_permalink( $p->ID ),
-			'edit_url'        => get_edit_post_link( $p->ID, 'raw' ),
-			'report_url'      => admin_url( 'admin.php?page=content-analyzer-report&post_id=' . (int) $p->ID ),
-			'date_published'  => $p->post_date,
-			'date_modified'   => $p->post_modified,
-			'categories'      => $cats,
-			'char_count'      => mb_strlen( $text ),
-			'word_count'      => is_array( $words ) ? count( $words ) : 0,
-			'paragraph_count' => ca_count_paragraphs( $p->post_content ),
-			'headings'        => array(
-				'h1' => count( $hdg['h1'] ?? array() ),
-				'h2' => count( $hdg['h2'] ?? array() ),
-				'h3' => count( $hdg['h3'] ?? array() ),
-				'h4' => count( $hdg['h4'] ?? array() ),
-				'h5' => count( $hdg['h5'] ?? array() ),
-				'h6' => count( $hdg['h6'] ?? array() ),
-				'total' => (int) ( $hdg['total'] ?? 0 ),
+		$out[] = array(
+			'post_id'        => $p->ID,
+			'title'          => $p->post_title,
+			'post_type'      => $p->post_type,
+			'post_status'    => $p->post_status,
+			'url'            => get_permalink( $p->ID ),
+			'edit_url'       => get_edit_post_link( $p->ID, 'raw' ),
+			'date_published' => $p->post_date,
+			'date_modified'  => $p->post_modified,
+			'categories'     => $cats,
+			'word_count'     => $wcount,
+			'char_count'     => $ccount,
+			'paragraph_count'=> bcca_count_paragraphs( $p->post_content ),
+			'headings'       => array(
+				'h1' => count( $head['h1'] ?? array() ),
+				'h2' => count( $head['h2'] ?? array() ),
+				'h3' => count( $head['h3'] ?? array() ),
+				'h4' => count( $head['h4'] ?? array() ),
+				'h5' => count( $head['h5'] ?? array() ),
+				'h6' => count( $head['h6'] ?? array() ),
+				'total' => (int) ( $head['total'] ?? 0 ),
 			),
-			'default_topic' => $default_topic,
-			'has_focus_meta' => $focus !== '',
 		);
 	}
 
-	wp_send_json_success( $r );
+	wp_send_json_success( $out );
 } );
 
-/**
- * AJAX: categories
- */
-add_action( 'wp_ajax_ca_get_categories', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
-	$cats = get_categories( array( 'hide_empty' => false ) );
-	$l = array();
-	foreach ( $cats as $c ) { $l[] = array( 'id' => $c->term_id, 'name' => $c->name ); }
-	wp_send_json_success( $l );
-} );
+/* ============================================================
+   AJAX: Report base data
+   ============================================================ */
+add_action( 'wp_ajax_bcca_get_post_report', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
-/**
- * AJAX: post detail (for report header)
- */
-add_action( 'wp_ajax_ca_get_post_detail', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+	$post_id = absint( $_POST['post_id'] ?? 0 );
+	$post    = get_post( $post_id );
+	if ( ! $post ) {
+		wp_send_json_error( 'Not found' );
+	}
 
-	$pid = absint( $_POST['post_id'] ?? 0 );
-	$post = get_post( $pid );
-	if ( ! $post ) { wp_send_json_error( 'Not found' ); }
+	$text   = bcca_plain_text_from_post( $post );
+	$words  = preg_split( '/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY );
+	$wcount = is_array( $words ) ? count( $words ) : 0;
 
-	$text  = ca_get_plain_text( $post );
-	$words = preg_split( '/\s+/', $text, -1, PREG_SPLIT_NO_EMPTY );
-	$sents = preg_split( '/[.!?]+(?=\s|$)/u', $text, -1, PREG_SPLIT_NO_EMPTY );
-	$sc = count( array_filter( (array) $sents, function( $s ) { return mb_strlen( trim( (string) $s ) ) > 2; } ) );
+	$head = bcca_extract_headings( $post->post_content );
 
 	$cats = array();
 	if ( $post->post_type === 'post' ) {
-		$c = get_the_category( $pid );
-		if ( $c ) { foreach ( $c as $cat ) { $cats[] = $cat->name; } }
+		$c = get_the_category( $post_id );
+		if ( $c ) {
+			foreach ( $c as $cat ) {
+				$cats[] = $cat->name;
+			}
+		}
 	}
 
-	$headings = ca_extract_headings( $post->post_content );
-	$focus = trim( (string) get_post_meta( $pid, '_ca_focus_phrase', true ) );
-	$h1 = ca_get_first_h1_text( $post->post_content );
+	$default_topic = bcca_default_topic_for_post( $post );
 
 	wp_send_json_success( array(
-		'post_id'         => $pid,
-		'title'           => $post->post_title,
-		'post_type'       => $post->post_type,
-		'url'             => get_permalink( $pid ),
-		'edit_url'        => get_edit_post_link( $pid, 'raw' ),
-		'date_published'  => $post->post_date,
-		'date_modified'   => $post->post_modified,
-		'categories'      => $cats,
-		'char_count'      => mb_strlen( $text ),
-		'char_count_no_spaces' => mb_strlen( preg_replace( '/\s/', '', $text ) ),
-		'word_count'      => is_array( $words ) ? count( $words ) : 0,
-		'sentence_count'  => $sc,
-		'paragraph_count' => ca_count_paragraphs( $post->post_content ),
-		'reading_time'    => max( 1, round( ( is_array( $words ) ? count( $words ) : 0 ) / 200 ) ),
-		'headings'        => $headings,
-		'chunks'          => ca_extract_chunks( $post->post_content ),
-		'entities'        => ca_extract_entities( $text ),
-		'focus_phrase_meta' => $focus,
-		'h1'              => $h1,
-		'default_topic'   => ca_get_effective_topic_for_post( $post, '' ),
+		'post_id'        => $post_id,
+		'title'          => $post->post_title,
+		'post_type'      => $post->post_type,
+		'post_status'    => $post->post_status,
+		'url'            => get_permalink( $post_id ),
+		'edit_url'       => get_edit_post_link( $post_id, 'raw' ),
+		'date_published' => $post->post_date,
+		'date_modified'  => $post->post_modified,
+		'categories'     => $cats,
+		'word_count'     => $wcount,
+		'char_count'     => mb_strlen( $text ),
+		'paragraph_count'=> bcca_count_paragraphs( $post->post_content ),
+		'headings'       => $head,
+		'default_topic'  => $default_topic,
+		'meta_topic'     => (string) get_post_meta( $post_id, '_ca_focus_phrase', true ),
 	) );
 } );
 
-/**
- * ============================================================
- * AJAX: cache get / save / clear
- * ============================================================
- */
-add_action( 'wp_ajax_ca_get_cached_analysis', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+/* ============================================================
+   AJAX: Cache fetch (word/chunk)
+   ============================================================ */
+add_action( 'wp_ajax_bcca_get_cached_analysis', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
-	$pid    = absint( $_POST['post_id'] ?? 0 );
-	$type   = sanitize_text_field( $_POST['analysis_type'] ?? '' ); // embedding | chunks
-	$phrase = sanitize_text_field( $_POST['phrase'] ?? '' );
-	$mode   = sanitize_text_field( $_POST['mode'] ?? '' );
+	$post_id = absint( $_POST['post_id'] ?? 0 );
+	$mode    = sanitize_text_field( $_POST['mode'] ?? 'server' );
+	$type    = sanitize_text_field( $_POST['analysis_type'] ?? 'word' );
+	$phrase  = sanitize_text_field( $_POST['phrase'] ?? '' );
 
-	if ( ! $pid || ! in_array( $type, array( 'embedding', 'chunks' ), true ) ) {
+	if ( ! $post_id || ! in_array( $mode, array( 'server', 'browser' ), true ) || ! in_array( $type, array( 'word', 'chunk' ), true ) || $phrase === '' ) {
 		wp_send_json_error( 'Missing data' );
 	}
-	if ( ! in_array( $mode, array( 'server', 'browser' ), true ) ) {
-		$mode = ca_get_settings()['mode'];
-	}
 
-	$cached = ca_cache_get( $pid, $mode, $type, $phrase );
+	$cached = bcca_cache_get( $post_id, $mode, $type, $phrase );
 	if ( ! $cached ) {
 		wp_send_json_success( array( 'found' => false ) );
 	}
@@ -815,966 +818,1055 @@ add_action( 'wp_ajax_ca_get_cached_analysis', function() {
 	wp_send_json_success( array(
 		'found'      => true,
 		'created_at' => $cached['created_at'],
-		'phrase'     => $cached['focus_phrase'],
+		'phrase'     => $cached['phrase_text'],
 		'data'       => $cached['data'],
 	) );
 } );
 
-add_action( 'wp_ajax_ca_save_cached_analysis', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+/* ============================================================
+   AJAX: Cache save (used mainly for browser mode results)
+   ============================================================ */
+add_action( 'wp_ajax_bcca_save_cached_analysis', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
-	$pid    = absint( $_POST['post_id'] ?? 0 );
-	$type   = sanitize_text_field( $_POST['analysis_type'] ?? '' ); // embedding | chunks
-	$phrase = sanitize_text_field( $_POST['phrase'] ?? '' );
-	$mode   = sanitize_text_field( $_POST['mode'] ?? '' );
-	$data_raw = wp_unslash( $_POST['analysis_data'] ?? '' );
+	$post_id = absint( $_POST['post_id'] ?? 0 );
+	$mode    = sanitize_text_field( $_POST['mode'] ?? 'browser' );
+	$type    = sanitize_text_field( $_POST['analysis_type'] ?? 'word' );
+	$phrase  = sanitize_text_field( $_POST['phrase'] ?? '' );
+	$data    = isset( $_POST['data'] ) ? json_decode( wp_unslash( (string) $_POST['data'] ), true ) : null;
 
-	if ( ! $pid || $phrase === '' || ! in_array( $type, array( 'embedding', 'chunks' ), true ) ) {
+	if ( ! $post_id || ! in_array( $mode, array( 'server', 'browser' ), true ) || ! in_array( $type, array( 'word', 'chunk' ), true ) || $phrase === '' || ! is_array( $data ) ) {
 		wp_send_json_error( 'Missing data' );
 	}
-	if ( ! in_array( $mode, array( 'server', 'browser' ), true ) ) {
-		$mode = ca_get_settings()['mode'];
+
+	$ok = bcca_cache_save( $post_id, $mode, $type, $phrase, $data );
+	if ( ! $ok ) {
+		wp_send_json_error( 'Save failed' );
 	}
 
-	$decoded = json_decode( (string) $data_raw, true );
-	if ( ! is_array( $decoded ) ) {
-		wp_send_json_error( 'Invalid data' );
-	}
-
-	// Minimal hardening: limit stored payload size.
-	$encoded = wp_json_encode( $decoded, JSON_UNESCAPED_UNICODE );
-	if ( $encoded && strlen( $encoded ) > 800000 ) { // ~800KB
-		wp_send_json_error( 'Payload too large' );
-	}
-
-	ca_cache_set( $pid, $mode, $type, $phrase, $decoded );
-	wp_send_json_success( array( 'saved' => true, 'created_at' => current_time( 'mysql' ) ) );
+	wp_send_json_success( array( 'saved' => true ) );
 } );
 
-add_action( 'wp_ajax_ca_clear_post_cache', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
-	$pid = absint( $_POST['post_id'] ?? 0 );
-	if ( ! $pid ) { wp_send_json_error( 'Missing data' ); }
-	ca_cache_delete_for_post( $pid );
-	wp_send_json_success( array( 'cleared' => true ) );
-} );
+/* ============================================================
+   AJAX: Run server word analysis (cached unless forced)
+   ============================================================ */
+add_action( 'wp_ajax_bcca_run_word_analysis', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
-/**
- * ============================================================
- * AJAX: server analyses (returns result; caller can save to cache)
- * ============================================================
- */
-add_action( 'wp_ajax_ca_run_embedding_server', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+	$post_id = absint( $_POST['post_id'] ?? 0 );
+	$phrase  = sanitize_text_field( $_POST['phrase'] ?? '' );
+	$force   = ! empty( $_POST['force'] );
 
-	$pid = absint( $_POST['post_id'] ?? 0 );
-	$phrase = sanitize_text_field( $_POST['phrase'] ?? '' );
-	if ( ! $pid || $phrase === '' ) { wp_send_json_error( 'Missing data' ); }
+	if ( ! $post_id || $phrase === '' ) {
+		wp_send_json_error( 'Missing data' );
+	}
 
-	$post = get_post( $pid );
-	if ( ! $post ) { wp_send_json_error( 'Not found' ); }
+	$post = get_post( $post_id );
+	if ( ! $post ) {
+		wp_send_json_error( 'Not found' );
+	}
 
-	$text = ca_get_plain_text( $post );
+	$opts = bcca_get_settings();
+	$mode = ( $opts['mode'] === 'browser' ) ? 'browser' : 'server';
 
-	$topic_vec = ca_build_tf_vector( $phrase );
+	// If browser mode -> return text payload, the browser will compute and then save cache via AJAX
+	if ( $mode === 'browser' ) {
+		$text = bcca_plain_text_from_post( $post );
+		wp_send_json_success( array(
+			'mode'   => 'browser',
+			'phrase' => $phrase,
+			'text'   => $text,
+		) );
+	}
 
-	// Lightweight bigrams from the phrase.
-	$phrase_lower = mb_strtolower( $phrase );
-	$phrase_words = preg_split( '/[^\p{L}\p{N}\-]+/u', $phrase_lower, -1, PREG_SPLIT_NO_EMPTY );
-	if ( is_array( $phrase_words ) && count( $phrase_words ) >= 2 ) {
-		for ( $i = 0; $i < count( $phrase_words ) - 1; $i++ ) {
-			$bg = trim( $phrase_words[ $i ], '-' ) . ' ' . trim( $phrase_words[ $i + 1 ], '-' );
-			if ( mb_strlen( $bg ) >= 5 ) { $topic_vec[ $bg ] = ( $topic_vec[ $bg ] ?? 0 ) + 0.35; }
+	// Server cache
+	if ( ! $force ) {
+		$cached = bcca_cache_get( $post_id, 'server', 'word', $phrase );
+		if ( $cached ) {
+			wp_send_json_success( array(
+				'mode'       => 'server',
+				'cached'     => true,
+				'created_at' => $cached['created_at'],
+				'phrase'     => $cached['phrase_text'],
+				'data'       => $cached['data'],
+			) );
 		}
 	}
+
+	$text = bcca_plain_text_from_post( $post );
+
+	$topic_vec = bcca_tf_vector( $phrase );
+
+	// lightweight bigram boost from phrase
+	$pl = mb_strtolower( $phrase );
+	$pw = preg_split( '/[^\p{L}\p{N}\-]+/u', $pl, -1, PREG_SPLIT_NO_EMPTY );
+	if ( is_array( $pw ) && count( $pw ) >= 2 ) {
+		for ( $i = 0; $i < count( $pw ) - 1; $i++ ) {
+			$bg = trim( $pw[ $i ], '-' ) . ' ' . trim( $pw[ $i + 1 ], '-' );
+			if ( mb_strlen( $bg ) >= 5 ) {
+				$topic_vec[ $bg ] = ( $topic_vec[ $bg ] ?? 0 ) + 0.35;
+			}
+		}
+	}
+
 	$topic_terms = array_keys( $topic_vec );
 
-	$text_lower = mb_strtolower( $text );
-	$all_words  = preg_split( '/[^\p{L}\p{N}\-]+/u', $text_lower, -1, PREG_SPLIT_NO_EMPTY );
-	$stop = ca_get_stop_words();
-
-	// Frequency map (limit unique terms for performance)
-	$wf = array();
-	foreach ( (array) $all_words as $w ) {
-		$w = trim( (string) $w, '-' );
-		if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) { continue; }
-		if ( ! isset( $wf[ $w ] ) ) { $wf[ $w ] = 0; }
-		$wf[ $w ]++;
+	$lower = mb_strtolower( $text );
+	$all_words = preg_split( '/[^\p{L}\p{N}\-]+/u', $lower, -1, PREG_SPLIT_NO_EMPTY );
+	if ( ! is_array( $all_words ) ) {
+		$all_words = array();
 	}
-	arsort( $wf );
 
-	$max_terms = 600;
-	$wf = array_slice( $wf, 0, $max_terms, true );
+	$stop = bcca_stop_words();
 
-	$ws = array();
-	foreach ( $wf as $word => $count ) {
-		$dm = in_array( $word, $topic_terms, true ) ? 1.0 : 0.0;
-		$cv = ca_build_context_vector( $text_lower, $word, (array) $all_words );
-		$cs = ca_cosine_similarity( $topic_vec, $cv );
+	// frequency map
+	$freq = array();
+	foreach ( $all_words as $w ) {
+		$w = trim( $w, '-' );
+		if ( mb_strlen( $w ) < 3 || in_array( $w, $stop, true ) ) {
+			continue;
+		}
+		$freq[ $w ] = ( $freq[ $w ] ?? 0 ) + 1;
+	}
+	arsort( $freq );
 
-		$score = round( min( 1.0, ( $dm * 0.55 ) + ( $cs * 0.45 ) ), 4 );
+	// limit terms for performance
+	$freq = array_slice( $freq, 0, 600, true );
 
-		$ws[] = array(
+	$words_scored = array();
+	foreach ( $freq as $word => $count ) {
+		$direct = in_array( $word, $topic_terms, true ) ? 1.0 : 0.0;
+		$ctx    = bcca_context_vector( $all_words, $word, 5 );
+		$cs     = bcca_cosine( $topic_vec, $ctx );
+
+		$score  = min( 1.0, ( $direct * 0.55 ) + ( $cs * 0.45 ) );
+
+		$words_scored[] = array(
 			'word'            => $word,
 			'count'           => $count,
-			'direct_match'    => $dm > 0,
+			'direct_match'    => ( $direct > 0 ),
 			'context_score'   => round( $cs * 100, 1 ),
 			'relevance_score' => round( $score * 100, 1 ),
 		);
 	}
 
-	usort( $ws, function( $a, $b ) { return $b['relevance_score'] <=> $a['relevance_score']; } );
+	usort( $words_scored, function ( $a, $b ) {
+		return ( $b['relevance_score'] <=> $a['relevance_score'] );
+	} );
 
-	$tv = ca_build_tf_vector( $text );
-	$os = ca_cosine_similarity( $topic_vec, $tv );
+	$overall = bcca_cosine( $topic_vec, bcca_tf_vector( $text ) );
 
-	$tw = count( $ws );
-	$hi = count( array_filter( $ws, function( $w ) { return ( $w['relevance_score'] ?? 0 ) >= 40; } ) );
-	$md = count( array_filter( $ws, function( $w ) { $r = ( $w['relevance_score'] ?? 0 ); return $r >= 15 && $r < 40; } ) );
-	$lo = count( array_filter( $ws, function( $w ) { return ( $w['relevance_score'] ?? 0 ) < 15; } ) );
-	$av = $tw > 0 ? round( array_sum( array_column( $ws, 'relevance_score' ) ) / $tw, 1 ) : 0;
+	$tw = count( $words_scored );
+	$hi = count( array_filter( $words_scored, function ( $w ) { return $w['relevance_score'] >= 40; } ) );
+	$md = count( array_filter( $words_scored, function ( $w ) { return $w['relevance_score'] >= 15 && $w['relevance_score'] < 40; } ) );
+	$lo = count( array_filter( $words_scored, function ( $w ) { return $w['relevance_score'] < 15; } ) );
+	$av = $tw ? round( array_sum( array_column( $words_scored, 'relevance_score' ) ) / $tw, 1 ) : 0;
 
-	wp_send_json_success( array(
-		'mode'               => 'server',
+	$data = array(
 		'phrase'             => $phrase,
-		'overall_similarity' => round( $os * 100, 1 ),
+		'overall_similarity' => round( $overall * 100, 1 ),
 		'total_unique_words' => $tw,
 		'high_relevance'     => $hi,
 		'medium_relevance'   => $md,
 		'low_relevance'      => $lo,
 		'average_relevance'  => $av,
-		'words'              => array_slice( $ws, 0, 200 ),
+		'words'              => array_slice( $words_scored, 0, 200 ),
+	);
+
+	bcca_cache_save( $post_id, 'server', 'word', $phrase, $data );
+
+	wp_send_json_success( array(
+		'mode'       => 'server',
+		'cached'     => false,
+		'created_at' => current_time( 'mysql' ),
+		'phrase'     => $phrase,
+		'data'       => $data,
 	) );
 } );
 
-add_action( 'wp_ajax_ca_run_chunks_server', function() {
-	check_ajax_referer( 'ca_nonce', 'nonce' );
-	if ( ! current_user_can( 'edit_posts' ) ) { wp_send_json_error( 'Unauthorized' ); }
+/* ============================================================
+   AJAX: Run server chunk analysis (cached unless forced)
+   ============================================================ */
+add_action( 'wp_ajax_bcca_run_chunk_analysis', function () {
+	check_ajax_referer( 'bcca_nonce', 'nonce' );
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_send_json_error( 'Unauthorized' );
+	}
 
-	$pid = absint( $_POST['post_id'] ?? 0 );
-	$phrase = sanitize_text_field( $_POST['phrase'] ?? '' );
-	if ( ! $pid || $phrase === '' ) { wp_send_json_error( 'Missing data' ); }
+	$post_id = absint( $_POST['post_id'] ?? 0 );
+	$phrase  = sanitize_text_field( $_POST['phrase'] ?? '' );
+	$force   = ! empty( $_POST['force'] );
 
-	$post = get_post( $pid );
-	if ( ! $post ) { wp_send_json_error( 'Not found' ); }
+	if ( ! $post_id || $phrase === '' ) {
+		wp_send_json_error( 'Missing data' );
+	}
 
-	$chunks = ca_extract_chunks( $post->post_content );
-	$tv = ca_build_tf_vector( $phrase );
+	$post = get_post( $post_id );
+	if ( ! $post ) {
+		wp_send_json_error( 'Not found' );
+	}
 
-	$phrase_lower = mb_strtolower( $phrase );
-	$phrase_words = preg_split( '/[^\p{L}\p{N}\-]+/u', $phrase_lower, -1, PREG_SPLIT_NO_EMPTY );
-	if ( is_array( $phrase_words ) && count( $phrase_words ) >= 2 ) {
-		for ( $i = 0; $i < count( $phrase_words ) - 1; $i++ ) {
-			$bg = trim( $phrase_words[ $i ], '-' ) . ' ' . trim( $phrase_words[ $i + 1 ], '-' );
-			if ( mb_strlen( $bg ) >= 5 ) { $tv[ $bg ] = ( $tv[ $bg ] ?? 0 ) + 0.35; }
+	$opts = bcca_get_settings();
+	$mode = ( $opts['mode'] === 'browser' ) ? 'browser' : 'server';
+
+	$chunks = bcca_extract_chunks( $post->post_content );
+
+	// Browser mode: return chunks payload for client-side compute and cache save
+	if ( $mode === 'browser' ) {
+		wp_send_json_success( array(
+			'mode'   => 'browser',
+			'phrase' => $phrase,
+			'chunks' => $chunks,
+		) );
+	}
+
+	// Server cache
+	if ( ! $force ) {
+		$cached = bcca_cache_get( $post_id, 'server', 'chunk', $phrase );
+		if ( $cached ) {
+			wp_send_json_success( array(
+				'mode'       => 'server',
+				'cached'     => true,
+				'created_at' => $cached['created_at'],
+				'phrase'     => $cached['phrase_text'],
+				'data'       => $cached['data'],
+			) );
 		}
 	}
 
-	$results = array();
-	foreach ( $chunks as $ch ) {
-		$cv  = ca_build_tf_vector( $ch['text'] );
-		$sim = ca_cosine_similarity( $tv, $cv );
+	$topic = bcca_tf_vector( $phrase );
 
-		$cl = mb_strtolower( (string) $ch['text'] );
-		$tf = array();
-		foreach ( array_keys( $tv ) as $term ) {
-			if ( strpos( $term, ' ' ) !== false ) { continue; } // highlight only single words
-			$cnt = mb_substr_count( $cl, $term );
-			if ( $cnt > 0 ) { $tf[] = array( 'term' => $term, 'count' => $cnt ); }
+	// bigram boost from phrase
+	$pl = mb_strtolower( $phrase );
+	$pw = preg_split( '/[^\p{L}\p{N}\-]+/u', $pl, -1, PREG_SPLIT_NO_EMPTY );
+	if ( is_array( $pw ) && count( $pw ) >= 2 ) {
+		for ( $i = 0; $i < count( $pw ) - 1; $i++ ) {
+			$bg = trim( $pw[ $i ], '-' ) . ' ' . trim( $pw[ $i + 1 ], '-' );
+			if ( mb_strlen( $bg ) >= 5 ) {
+				$topic[ $bg ] = ( $topic[ $bg ] ?? 0 ) + 0.35;
+			}
 		}
+	}
 
-		$results[] = array(
-			'index'             => $ch['index'],
-			'text'              => $ch['text'],
-			'word_count'        => $ch['word_count'],
-			'similarity'        => $sim,
-			'similarity_percent'=> round( $sim * 100, 1 ),
-			'topic_terms_found' => $tf,
+	$res = array();
+	foreach ( $chunks as $ch ) {
+		$vec = bcca_tf_vector( $ch['text'] ?? '' );
+		$sim = bcca_cosine( $topic, $vec );
+
+		$res[] = array(
+			'index'              => $ch['index'],
+			'text'               => $ch['text'],
+			'word_count'         => $ch['word_count'],
+			'similarity'         => round( $sim, 4 ),
+			'similarity_percent' => round( $sim * 100, 1 ),
 		);
 	}
 
-	usort( $results, function( $a, $b ) { return $b['similarity'] <=> $a['similarity']; } );
-	$avg = count( $results ) > 0 ? array_sum( array_column( $results, 'similarity' ) ) / count( $results ) : 0;
-	$mx  = count( $results ) > 0 ? max( array_column( $results, 'similarity_percent' ) ) : 0;
-	$mn  = count( $results ) > 0 ? min( array_column( $results, 'similarity_percent' ) ) : 0;
+	usort( $res, function ( $a, $b ) {
+		return ( $b['similarity'] <=> $a['similarity'] );
+	} );
 
-	wp_send_json_success( array(
-		'mode'               => 'server',
+	$avg = count( $res ) ? array_sum( array_column( $res, 'similarity' ) ) / count( $res ) : 0;
+	$mx  = count( $res ) ? max( array_column( $res, 'similarity_percent' ) ) : 0;
+	$mn  = count( $res ) ? min( array_column( $res, 'similarity_percent' ) ) : 0;
+
+	$data = array(
 		'phrase'             => $phrase,
-		'chunks'             => $results,
-		'chunk_count'        => count( $results ),
+		'chunks'             => array_slice( $res, 0, 120 ),
+		'chunk_count'        => count( $res ),
 		'average_similarity' => round( $avg, 4 ),
 		'average_percent'    => round( $avg * 100, 1 ),
 		'max_percent'        => $mx,
 		'min_percent'        => $mn,
+	);
+
+	bcca_cache_save( $post_id, 'server', 'chunk', $phrase, $data );
+
+	wp_send_json_success( array(
+		'mode'       => 'server',
+		'cached'     => false,
+		'created_at' => current_time( 'mysql' ),
+		'phrase'     => $phrase,
+		'data'       => $data,
 	) );
 } );
 
-/**
- * ============================================================
- * ADMIN: LIST PAGE
- * - Improved list view (headings summary visible immediately)
- * - Click row/title -> Report page for that post
- * ============================================================
- */
-function ca_render_list_page() {
+/* ============================================================
+   LIST PAGE (sortable, URL+Chars+headings summary)
+   ============================================================ */
+function bcca_render_list_page() {
+	if ( ! current_user_can( 'edit_posts' ) ) {
+		wp_die( esc_html__( 'You do not have permission to access this page.', 'beeclear-content-analyzer' ) );
+	}
+
+	$opts = bcca_get_settings();
 	?>
 	<div class="wrap">
-		<h1 style="display:flex;align-items:center;gap:8px;">
-			<span class="dashicons dashicons-chart-bar" style="font-size:28px;width:28px;height:28px;color:#2271b1"></span>
+		<h1 style="display:flex;align-items:center;gap:10px;">
+			<span class="dashicons dashicons-chart-bar" style="font-size:28px;width:28px;height:28px;color:#2271b1;"></span>
 			<?php echo esc_html__( 'Content Analyzer', 'beeclear-content-analyzer' ); ?>
 		</h1>
 
-		<div class="notice notice-info">
-			<p style="margin:0;">
-				<?php
-				$opts = ca_get_settings();
-				echo esc_html__( 'Mode:', 'beeclear-content-analyzer' ) . ' ' . '<strong>' . esc_html( $opts['mode'] ) . '</strong> — ';
-				echo esc_html__( 'Click a row to open the report. Analyses are cached per topic and mode.', 'beeclear-content-analyzer' );
-				?>
-			</p>
-		</div>
+		<p class="description">
+			<?php echo esc_html__( 'Click a row to open the report for that page/post. Sorting is available on most columns.', 'beeclear-content-analyzer' ); ?>
+			<br/>
+			<?php echo esc_html__( 'Current mode:', 'beeclear-content-analyzer' ); ?>
+			<strong><?php echo esc_html( $opts['mode'] ); ?></strong>
+		</p>
 
-		<div id="ca-loading" style="display:none; padding:14px 0;">
-			<span class="spinner is-active" style="float:none;margin:0 8px 0 0;"></span>
-			<?php echo esc_html__( 'Loading…', 'beeclear-content-analyzer' ); ?>
-		</div>
+		<style>
+			.bcca-card{background:#fff;border:1px solid #c3c4c7;border-radius:8px;box-shadow:0 1px 1px rgba(0,0,0,.04);padding:14px 16px;margin:14px 0;}
+			.bcca-table-wrap{overflow:auto}
+			.bcca-table{width:100%;border-collapse:collapse}
+			.bcca-table thead th{background:#f0f0f1;border-bottom:2px solid #c3c4c7;padding:10px;white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:.35px;color:#50575e}
+			.bcca-table tbody td{border-bottom:1px solid #e0e0e0;padding:10px;vertical-align:top}
+			.bcca-table tbody tr:hover{background:#f6f7f7}
+			.bcca-title{font-weight:700;color:#2271b1;text-decoration:none}
+			.bcca-title:hover{text-decoration:underline}
+			.bcca-url{font-size:12px;color:#50575e;word-break:break-all}
+			.bcca-badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #e0e0e0;background:#f6f7f7;border-radius:999px;padding:2px 8px;font-size:12px;margin:2px 4px 2px 0}
+			.bcca-actions a{margin-right:10px;text-decoration:none;display:inline-flex;align-items:center;gap:6px}
+			.bcca-actions a:hover{text-decoration:underline}
+			.bcca-sort{cursor:pointer;user-select:none}
+			.bcca-sort .ico{opacity:.45;font-size:10px;margin-left:4px}
+			.bcca-sort.asc .ico{opacity:1}
+			.bcca-sort.desc .ico{opacity:1}
+			.bcca-muted{color:#646970;font-size:12px}
+			.bcca-loading{display:flex;align-items:center;gap:8px;color:#50575e}
+		</style>
 
-		<div style="background:#fff;border:1px solid #c3c4c7;border-radius:8px;padding:16px;margin:12px 0;max-width:1200px;">
-			<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;">
-				<div>
-					<label style="font-size:11px;font-weight:600;color:#50575e;text-transform:uppercase;letter-spacing:.4px;"><?php echo esc_html__( 'Search', 'beeclear-content-analyzer' ); ?></label><br>
-					<input type="text" id="ca-filter-search" class="regular-text" placeholder="<?php echo esc_attr__( 'title, slug…', 'beeclear-content-analyzer' ); ?>">
-				</div>
-				<div>
-					<label style="font-size:11px;font-weight:600;color:#50575e;text-transform:uppercase;letter-spacing:.4px;"><?php echo esc_html__( 'Type', 'beeclear-content-analyzer' ); ?></label><br>
-					<select id="ca-filter-type">
-						<option value=""><?php echo esc_html__( 'All', 'beeclear-content-analyzer' ); ?></option>
-						<option value="post"><?php echo esc_html__( 'Post', 'beeclear-content-analyzer' ); ?></option>
-						<option value="page"><?php echo esc_html__( 'Page', 'beeclear-content-analyzer' ); ?></option>
-					</select>
-				</div>
-				<div>
-					<label style="font-size:11px;font-weight:600;color:#50575e;text-transform:uppercase;letter-spacing:.4px;"><?php echo esc_html__( 'Status', 'beeclear-content-analyzer' ); ?></label><br>
-					<select id="ca-filter-status">
-						<option value=""><?php echo esc_html__( 'All', 'beeclear-content-analyzer' ); ?></option>
-						<option value="publish"><?php echo esc_html__( 'Publish', 'beeclear-content-analyzer' ); ?></option>
-						<option value="draft"><?php echo esc_html__( 'Draft', 'beeclear-content-analyzer' ); ?></option>
-						<option value="private"><?php echo esc_html__( 'Private', 'beeclear-content-analyzer' ); ?></option>
-					</select>
-				</div>
-				<div>
-					<label style="font-size:11px;font-weight:600;color:#50575e;text-transform:uppercase;letter-spacing:.4px;"><?php echo esc_html__( 'Category', 'beeclear-content-analyzer' ); ?></label><br>
-					<select id="ca-filter-category"><option value=""><?php echo esc_html__( 'All', 'beeclear-content-analyzer' ); ?></option></select>
-				</div>
-				<div style="display:flex;gap:8px;">
-					<button class="button button-primary" id="ca-apply-filters"><?php echo esc_html__( 'Apply filters', 'beeclear-content-analyzer' ); ?></button>
-					<button class="button" id="ca-reset-filters"><?php echo esc_html__( 'Reset', 'beeclear-content-analyzer' ); ?></button>
-				</div>
-				<div style="margin-left:auto;color:#50575e;">
-					<?php echo esc_html__( 'Results:', 'beeclear-content-analyzer' ); ?> <strong id="ca-count">0</strong>
-				</div>
+		<div class="bcca-card">
+			<div class="bcca-loading" id="bcca-loading" style="display:none;">
+				<span class="spinner is-active" style="float:none;margin:0;"></span>
+				<?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?>
+			</div>
+
+			<div class="bcca-table-wrap">
+				<table class="bcca-table" id="bcca-table">
+					<thead>
+						<tr>
+							<th class="bcca-sort" data-key="title"><?php echo esc_html__( 'Title / URL', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="post_type"><?php echo esc_html__( 'Type', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="post_status"><?php echo esc_html__( 'Status', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th><?php echo esc_html__( 'Categories', 'beeclear-content-analyzer' ); ?></th>
+							<th class="bcca-sort" data-key="date_published"><?php echo esc_html__( 'Published', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="date_modified"><?php echo esc_html__( 'Updated', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="word_count"><?php echo esc_html__( 'Words', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="char_count"><?php echo esc_html__( 'Chars', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="headings_total"><?php echo esc_html__( 'Headings', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th class="bcca-sort" data-key="paragraph_count"><?php echo esc_html__( 'Paragraphs', 'beeclear-content-analyzer' ); ?> <span class="ico">↕</span></th>
+							<th><?php echo esc_html__( 'Actions', 'beeclear-content-analyzer' ); ?></th>
+						</tr>
+					</thead>
+					<tbody id="bcca-tbody">
+						<tr><td colspan="11" class="bcca-muted"><?php echo esc_html__( 'No data yet.', 'beeclear-content-analyzer' ); ?></td></tr>
+					</tbody>
+				</table>
 			</div>
 		</div>
 
-		<div style="overflow:auto; max-width: 100%;">
-			<table class="widefat striped" id="ca-table" style="max-width: 1400px;">
-				<thead>
-					<tr>
-						<th><?php echo esc_html__( 'Title', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'Type', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'Status', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'H1', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'H2', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'H3', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'H4', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'Words', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'Updated', 'beeclear-content-analyzer' ); ?></th>
-						<th><?php echo esc_html__( 'Topic source', 'beeclear-content-analyzer' ); ?></th>
-					</tr>
-				</thead>
-				<tbody id="ca-tbody">
-					<tr><td colspan="10"><em><?php echo esc_html__( 'No data.', 'beeclear-content-analyzer' ); ?></em></td></tr>
-				</tbody>
-			</table>
-		</div>
+		<script>
+		(function($){
+			'use strict';
+			function E(s){return String(s||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]})}
+			var rows=[], sort={key:'date_published', dir:'desc'};
 
-	</div>
-
-	<script>
-	(function($){
-	'use strict';
-	function E(t){return String(t||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]})}
-
-	var allPosts=[], filteredPosts=[];
-
-	$(document).ready(function(){
-		loadCats();
-		loadPosts();
-		bindEvents();
-	});
-
-	function loadCats(){
-		$.post(caData.ajaxUrl,{action:'ca_get_categories',nonce:caData.nonce},function(r){
-			if(r && r.success && r.data){
-				var s=$('#ca-filter-category');
-				r.data.forEach(function(c){
-					s.append('<option value="'+E(c.name)+'">'+E(c.name)+'</option>');
+			function getNum(v){v=parseFloat(v); return isNaN(v)?0:v;}
+			function valOf(r,key){
+				if(key==='headings_total'){ return getNum((r.headings && r.headings.total) ? r.headings.total : 0); }
+				return r[key];
+			}
+			function sortRows(){
+				var k=sort.key, d=sort.dir;
+				rows.sort(function(a,b){
+					var x=valOf(a,k), y=valOf(b,k);
+					// strings
+					if(typeof x==='string'){ x=x.toLowerCase(); }
+					if(typeof y==='string'){ y=y.toLowerCase(); }
+					// numeric keys
+					if(k==='word_count'||k==='char_count'||k==='paragraph_count'||k==='headings_total'){
+						x=getNum(x); y=getNum(y);
+					}
+					if(x<y) return d==='asc'?-1:1;
+					if(x>y) return d==='asc'?1:-1;
+					return 0;
 				});
 			}
-		});
-	}
 
-	function loadPosts(){
-		$('#ca-loading').show();
-		$.post(caData.ajaxUrl,{action:'ca_get_posts_list',nonce:caData.nonce},function(r){
-			$('#ca-loading').hide();
-			if(r && r.success && r.data){
-				allPosts=r.data; filteredPosts=r.data;
-				$('#ca-count').text(filteredPosts.length);
-				renderTable();
-			}else{
-				$('#ca-tbody').html('<tr><td colspan="10"><em><?php echo esc_js( __( 'No data.', 'beeclear-content-analyzer' ) ); ?></em></td></tr>');
+			function reportUrl(id){
+				return '<?php echo esc_js( admin_url( 'admin.php?page=bcca-report&post_id=' ) ); ?>'+id;
 			}
-		});
-	}
 
-	function bindEvents(){
-		$('#ca-apply-filters').on('click',function(e){e.preventDefault();applyFilters();});
-		$('#ca-reset-filters').on('click',function(e){e.preventDefault();resetFilters();});
-		$('#ca-tbody').on('click','tr[data-report]',function(){
-			var url=$(this).data('report');
-			if(url){ window.location.href=url; }
-		});
-	}
+			function render(){
+				sortRows();
+				var $tb=$('#bcca-tbody'); $tb.empty();
+				if(!rows.length){
+					$tb.html('<tr><td colspan="11" class="bcca-muted"><?php echo esc_js( __( 'No items found.', 'beeclear-content-analyzer' ) ); ?></td></tr>');
+					return;
+				}
+				rows.forEach(function(r){
+					var cats=(r.categories||[]).map(function(c){return '<span class="bcca-badge">'+E(c)+'</span>'}).join(' ');
+					if(!cats) cats='—';
 
-	function applyFilters(){
-		var s=$('#ca-filter-search').val().toLowerCase().trim(),
-			t=$('#ca-filter-type').val(),
-			st=$('#ca-filter-status').val(),
-			c=$('#ca-filter-category').val();
+					var h=r.headings||{h1:0,h2:0,h3:0,h4:0,h5:0,h6:0,total:0};
+					var hs =
+						'<span class="bcca-badge">H1: <strong>'+E(h.h1||0)+'</strong></span>'+
+						'<span class="bcca-badge">H2: <strong>'+E(h.h2||0)+'</strong></span>'+
+						'<span class="bcca-badge">H3: <strong>'+E(h.h3||0)+'</strong></span>'+
+						'<span class="bcca-badge">H4: <strong>'+E(h.h4||0)+'</strong></span>'+
+						'<span class="bcca-badge">H5: <strong>'+E(h.h5||0)+'</strong></span>'+
+						'<span class="bcca-badge">H6: <strong>'+E(h.h6||0)+'</strong></span>';
 
-		filteredPosts = allPosts.filter(function(p){
-			if(s && !(String(p.title||'').toLowerCase().includes(s)||String(p.slug||'').toLowerCase().includes(s))) return false;
-			if(t && p.post_type!==t) return false;
-			if(st && p.post_status!==st) return false;
-			if(c && !(p.categories||[]).includes(c)) return false;
-			return true;
-		});
-		$('#ca-count').text(filteredPosts.length);
-		renderTable();
-	}
+					var url = r.url || '';
+					var titleCell =
+						'<a class="bcca-title" href="'+E(reportUrl(r.post_id))+'">'+E(r.title)+'</a>'+
+						'<div class="bcca-url"><a href="'+E(url)+'" target="_blank" rel="noopener">'+E(url)+'</a></div>';
 
-	function resetFilters(){
-		$('#ca-filter-search').val('');
-		$('#ca-filter-type').val('');
-		$('#ca-filter-status').val('');
-		$('#ca-filter-category').val('');
-		filteredPosts=allPosts;
-		$('#ca-count').text(filteredPosts.length);
-		renderTable();
-	}
+					var actions =
+						'<div class="bcca-actions">'+
+							'<a href="'+E(reportUrl(r.post_id))+'"><span class="dashicons dashicons-analytics"></span><?php echo esc_js( __( 'Report', 'beeclear-content-analyzer' ) ); ?></a>'+
+							'<a href="'+E(r.edit_url||'#')+'"><span class="dashicons dashicons-edit"></span><?php echo esc_js( __( 'Edit', 'beeclear-content-analyzer' ) ); ?></a>'+
+							'<a href="'+E(url)+'" target="_blank" rel="noopener"><span class="dashicons dashicons-external"></span><?php echo esc_js( __( 'View', 'beeclear-content-analyzer' ) ); ?></a>'+
+						'</div>';
 
-	function badge(num){
-		var n=parseInt(num||0,10);
-		var bg = n>0 ? '#e7f5ff' : '#f6f7f7';
-		var bd = n>0 ? '#72aee6' : '#e0e0e0';
-		var cl = n>0 ? '#135e96' : '#50575e';
-		return '<span style="display:inline-block;min-width:26px;text-align:center;padding:2px 8px;border:1px solid '+bd+';background:'+bg+';color:'+cl+';border-radius:999px;font-weight:700;font-size:12px;">'+E(n)+'</span>';
-	}
+					var tr = '<tr data-id="'+E(r.post_id)+'" style="cursor:pointer;">'+
+						'<td>'+titleCell+'</td>'+
+						'<td>'+E(r.post_type)+'</td>'+
+						'<td>'+E(r.post_status)+'</td>'+
+						'<td>'+cats+'</td>'+
+						'<td>'+E(String(r.date_published||'').slice(0,10))+'</td>'+
+						'<td>'+E(String(r.date_modified||'').slice(0,10))+'</td>'+
+						'<td><strong>'+E(r.word_count)+'</strong></td>'+
+						'<td><strong>'+E(r.char_count)+'</strong></td>'+
+						'<td>'+hs+'<div class="bcca-muted">Total: <strong>'+E(h.total||0)+'</strong></div></td>'+
+						'<td>'+E(r.paragraph_count)+'</td>'+
+						'<td>'+actions+'</td>'+
+					'</tr>';
 
-	function renderTable(){
-		var tb=$('#ca-tbody'); tb.empty();
-		if(!filteredPosts.length){
-			tb.html('<tr><td colspan="10"><em><?php echo esc_js( __( 'No data.', 'beeclear-content-analyzer' ) ); ?></em></td></tr>');
-			return;
-		}
+					$tb.append(tr);
+				});
+			}
 
-		filteredPosts.forEach(function(p){
-			var topicSource = p.has_focus_meta ? 'Meta box' : (p.headings && p.headings.h1>0 ? 'H1' : 'Title');
-			var row = '<tr style="cursor:pointer" data-report="'+E(p.report_url)+'">'+
-				'<td><strong>'+E(p.title)+'</strong><div style="color:#646970;font-size:12px;">'+E(p.slug)+'</div></td>'+
-				'<td>'+E(p.post_type)+'</td>'+
-				'<td>'+E(p.post_status)+'</td>'+
-				'<td>'+badge(p.headings.h1)+'</td>'+
-				'<td>'+badge(p.headings.h2)+'</td>'+
-				'<td>'+badge(p.headings.h3)+'</td>'+
-				'<td>'+badge(p.headings.h4)+'</td>'+
-				'<td>'+E(p.word_count)+'</td>'+
-				'<td>'+E(String(p.date_modified||'').slice(0,10))+'</td>'+
-				'<td><span style="color:#50575e;">'+E(topicSource)+'</span></td>'+
-			'</tr>';
-			tb.append(row);
-		});
-	}
-	})(jQuery);
-	</script>
+			function load(){
+				$('#bcca-loading').show();
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_get_posts_list', nonce:window.bccaData.nonce}, function(resp){
+					$('#bcca-loading').hide();
+					if(resp && resp.success && resp.data){
+						rows = resp.data.map(function(r){
+							// for sorting convenience
+							r.headings_total = (r.headings && r.headings.total) ? r.headings.total : 0;
+							return r;
+						});
+						render();
+					}else{
+						$('#bcca-tbody').html('<tr><td colspan="11" class="bcca-muted"><?php echo esc_js( __( 'Failed to load data.', 'beeclear-content-analyzer' ) ); ?></td></tr>');
+					}
+				});
+			}
+
+			$(document).on('click','#bcca-table tbody tr', function(e){
+				// do not override clicks on links
+				if($(e.target).is('a') || $(e.target).closest('a').length){ return; }
+				var id = $(this).data('id');
+				if(id){ window.location.href = '<?php echo esc_js( admin_url( 'admin.php?page=bcca-report&post_id=' ) ); ?>'+id; }
+			});
+
+			$(document).on('click','.bcca-sort', function(){
+				var key=$(this).data('key');
+				if(!key) return;
+				if(sort.key===key){ sort.dir = (sort.dir==='asc')?'desc':'asc'; }
+				else { sort.key=key; sort.dir='asc'; }
+
+				$('.bcca-sort').removeClass('asc desc');
+				$(this).addClass(sort.dir);
+				render();
+			});
+
+			$(function(){ load(); });
+		})(jQuery);
+		</script>
+	</div>
 	<?php
 }
 
-/**
- * ============================================================
- * ADMIN: REPORT PAGE
- * - Shows cached analysis dates
- * - Runs analysis only when needed
- * - Topic priority: override input > meta box > first H1 > title
- * ============================================================
- */
-function ca_render_report_page() {
+/* ============================================================
+   REPORT PAGE
+   ============================================================ */
+function bcca_render_report_page() {
 	if ( ! current_user_can( 'edit_posts' ) ) {
 		wp_die( esc_html__( 'You do not have permission to access this page.', 'beeclear-content-analyzer' ) );
 	}
 
 	$post_id = absint( $_GET['post_id'] ?? 0 );
-	$post = $post_id ? get_post( $post_id ) : null;
+	$post    = $post_id ? get_post( $post_id ) : null;
 	if ( ! $post ) {
-		echo '<div class="wrap"><h1>' . esc_html__( 'Report', 'beeclear-content-analyzer' ) . '</h1><p>' . esc_html__( 'Post not found.', 'beeclear-content-analyzer' ) . '</p></div>';
+		echo '<div class="wrap"><h1>' . esc_html__( 'Content report', 'beeclear-content-analyzer' ) . '</h1><p>' . esc_html__( 'Post not found.', 'beeclear-content-analyzer' ) . '</p></div>';
 		return;
 	}
 
-	$opts = ca_get_settings();
-	$mode = $opts['mode'];
-
+	$opts = bcca_get_settings();
 	?>
-	<div class="wrap" style="max-width: 1300px;">
-		<p>
-			<a href="<?php echo esc_url( admin_url( 'admin.php?page=content-analyzer' ) ); ?>">&larr; <?php echo esc_html__( 'Back to list', 'beeclear-content-analyzer' ); ?></a>
-		</p>
-
+	<div class="wrap">
 		<h1 style="display:flex;align-items:center;gap:10px;">
-			<span class="dashicons dashicons-media-document" style="font-size:28px;width:28px;height:28px;color:#2271b1"></span>
-			<?php echo esc_html( $post->post_title ); ?>
-			<span style="color:#646970;font-size:13px;">#<?php echo (int) $post_id; ?></span>
+			<span class="dashicons dashicons-analytics" style="font-size:28px;width:28px;height:28px;color:#2271b1;"></span>
+			<?php echo esc_html__( 'Content report', 'beeclear-content-analyzer' ); ?>
 		</h1>
 
-		<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0 12px 0;">
-			<a class="button" href="<?php echo esc_url( get_edit_post_link( $post_id, 'raw' ) ); ?>"><?php echo esc_html__( 'Edit', 'beeclear-content-analyzer' ); ?></a>
-			<a class="button" href="<?php echo esc_url( get_permalink( $post_id ) ); ?>" target="_blank" rel="noopener"><?php echo esc_html__( 'View', 'beeclear-content-analyzer' ); ?></a>
-			<button class="button" id="ca-clear-cache"><?php echo esc_html__( 'Clear cached analyses', 'beeclear-content-analyzer' ); ?></button>
-			<span style="margin-left:auto;color:#50575e;padding-top:6px;">
-				<?php echo esc_html__( 'Mode:', 'beeclear-content-analyzer' ); ?> <strong id="ca-mode"><?php echo esc_html( $mode ); ?></strong>
-			</span>
-		</div>
+		<p class="description">
+			<?php echo esc_html__( 'Analyses are cached per topic + mode. Change the topic to generate a new cache entry.', 'beeclear-content-analyzer' ); ?>
+			<br/>
+			<?php echo esc_html__( 'Current mode:', 'beeclear-content-analyzer' ); ?>
+			<strong id="bcca-mode"><?php echo esc_html( $opts['mode'] ); ?></strong>
+		</p>
 
-		<div id="ca-report-loading" style="display:none; padding:14px 0;">
-			<span class="spinner is-active" style="float:none;margin:0 8px 0 0;"></span>
-			<?php echo esc_html__( 'Loading…', 'beeclear-content-analyzer' ); ?>
-		</div>
+		<style>
+			.bcca-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
+			.bcca-card{grid-column:span 12;background:#fff;border:1px solid #c3c4c7;border-radius:10px;box-shadow:0 1px 1px rgba(0,0,0,.04);padding:14px 16px}
+			@media(min-width:1000px){ .span6{grid-column:span 6} .span4{grid-column:span 4} }
+			.bcca-kpis{display:flex;flex-wrap:wrap;gap:8px}
+			.bcca-pill{background:#f6f7f7;border:1px solid #e0e0e0;border-radius:999px;padding:6px 10px;font-size:12px}
+			.bcca-pill strong{font-size:12px}
+			.bcca-badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #e0e0e0;background:#f6f7f7;border-radius:999px;padding:2px 8px;font-size:12px;margin:2px 4px 2px 0}
+			.bcca-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+			.bcca-row input[type="text"]{min-width:320px;height:36px;padding:4px 8px;border:1px solid #8c8f94;border-radius:6px}
+			.bcca-btn{display:inline-flex;align-items:center;gap:6px;height:36px;padding:0 12px;border-radius:6px;border:1px solid #2271b1;background:#2271b1;color:#fff;cursor:pointer}
+			.bcca-btn.secondary{background:#fff;color:#2271b1;border-color:#c3c4c7}
+			.bcca-btn:disabled{opacity:.6;cursor:not-allowed}
+			.bcca-muted{color:#646970;font-size:12px}
+			.bcca-table{width:100%;border-collapse:collapse}
+			.bcca-table th,.bcca-table td{border-bottom:1px solid #e0e0e0;padding:8px 10px;vertical-align:top}
+			.bcca-table th{background:#f6f7f7;font-size:11px;text-transform:uppercase;letter-spacing:.35px;color:#50575e;white-space:nowrap}
+			.bcca-score{display:flex;align-items:center;gap:12px;margin:10px 0}
+			.bcca-circle{width:62px;height:62px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff}
+			.low{background:#d63638}.med{background:#dba617}.good{background:#2ea2cc}.great{background:#1d9b4d}
+			.bcca-loading{display:flex;align-items:center;gap:8px;color:#50575e}
+			.bcca-hr{border-top:1px solid #e0e0e0;margin:12px 0}
+		</style>
 
-		<div style="background:#fff;border:1px solid #c3c4c7;border-radius:10px;padding:16px;margin:12px 0;">
-			<h2 style="margin-top:0;"><?php echo esc_html__( 'Topic & cache', 'beeclear-content-analyzer' ); ?></h2>
-
-			<div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
-				<div style="min-width: 360px;">
-					<label style="font-size:11px;font-weight:600;color:#50575e;text-transform:uppercase;letter-spacing:.4px;"><?php echo esc_html__( 'Topic for analysis', 'beeclear-content-analyzer' ); ?></label><br>
-					<input type="text" id="ca-topic" class="regular-text" style="width:100%;max-width:520px;" placeholder="<?php echo esc_attr__( 'Topic…', 'beeclear-content-analyzer' ); ?>">
-					<div style="color:#646970;font-size:12px;margin-top:4px;" id="ca-topic-hint"></div>
+		<div class="bcca-grid">
+			<div class="bcca-card span6">
+				<h2 style="margin-top:0;"><?php echo esc_html__( 'Page details', 'beeclear-content-analyzer' ); ?></h2>
+				<div class="bcca-kpis" id="bcca-kpis">
+					<span class="bcca-pill"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></span>
 				</div>
-
+				<div class="bcca-hr"></div>
 				<div>
-					<button class="button button-primary" id="ca-run-embedding"><?php echo esc_html__( 'Run embedding analysis', 'beeclear-content-analyzer' ); ?></button>
-					<div style="color:#646970;font-size:12px;margin-top:6px;">
-						<?php echo esc_html__( 'Cached:', 'beeclear-content-analyzer' ); ?> <span id="ca-embed-cached">—</span>
+					<div class="bcca-muted"><?php echo esc_html__( 'URL', 'beeclear-content-analyzer' ); ?></div>
+					<div><a id="bcca-url" href="<?php echo esc_url( get_permalink( $post_id ) ); ?>" target="_blank" rel="noopener"><?php echo esc_html( get_permalink( $post_id ) ); ?></a></div>
+				</div>
+				<div class="bcca-hr"></div>
+				<div class="bcca-muted"><?php echo esc_html__( 'Headings summary', 'beeclear-content-analyzer' ); ?></div>
+				<div id="bcca-headings-summary"></div>
+			</div>
+
+			<div class="bcca-card span6">
+				<h2 style="margin-top:0;"><?php echo esc_html__( 'Topic & actions', 'beeclear-content-analyzer' ); ?></h2>
+
+				<div class="bcca-row">
+					<div>
+						<div class="bcca-muted"><?php echo esc_html__( 'Topic (from metabox / H1 / title)', 'beeclear-content-analyzer' ); ?></div>
+						<input type="text" id="bcca-topic" value="" />
+						<div class="bcca-muted" id="bcca-topic-note"></div>
 					</div>
+					<button class="bcca-btn secondary" id="bcca-reset-topic"><span class="dashicons dashicons-update"></span><?php echo esc_html__( 'Reset to default', 'beeclear-content-analyzer' ); ?></button>
 				</div>
 
-				<div>
-					<button class="button button-primary" id="ca-run-chunks"><?php echo esc_html__( 'Run chunk analysis', 'beeclear-content-analyzer' ); ?></button>
-					<div style="color:#646970;font-size:12px;margin-top:6px;">
-						<?php echo esc_html__( 'Cached:', 'beeclear-content-analyzer' ); ?> <span id="ca-chunk-cached">—</span>
-					</div>
-				</div>
+				<div class="bcca-hr"></div>
 
-				<div style="margin-left:auto;">
-					<button class="button" id="ca-use-meta"><?php echo esc_html__( 'Use meta box topic', 'beeclear-content-analyzer' ); ?></button>
-					<button class="button" id="ca-use-h1"><?php echo esc_html__( 'Use H1', 'beeclear-content-analyzer' ); ?></button>
+				<div class="bcca-row">
+					<button class="bcca-btn" id="bcca-run-word"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run word analysis', 'beeclear-content-analyzer' ); ?></button>
+					<button class="bcca-btn secondary" id="bcca-run-word-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
 				</div>
+				<div class="bcca-muted" id="bcca-word-cacheinfo"></div>
+
+				<div class="bcca-hr"></div>
+
+				<div class="bcca-row">
+					<button class="bcca-btn" id="bcca-run-chunk"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run chunk analysis', 'beeclear-content-analyzer' ); ?></button>
+					<button class="bcca-btn secondary" id="bcca-run-chunk-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
+				</div>
+				<div class="bcca-muted" id="bcca-chunk-cacheinfo"></div>
+
+			</div>
+
+			<div class="bcca-card span6">
+				<h2 style="margin-top:0;"><?php echo esc_html__( 'Headings structure', 'beeclear-content-analyzer' ); ?></h2>
+				<div id="bcca-headings-structure" class="bcca-muted"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></div>
+			</div>
+
+			<div class="bcca-card span6">
+				<h2 style="margin-top:0;"><?php echo esc_html__( 'Word analysis results', 'beeclear-content-analyzer' ); ?></h2>
+				<div id="bcca-word-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
+			</div>
+
+			<div class="bcca-card">
+				<h2 style="margin-top:0;"><?php echo esc_html__( 'Chunk analysis results', 'beeclear-content-analyzer' ); ?></h2>
+				<div id="bcca-chunk-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
 			</div>
 		</div>
 
-		<div style="display:grid;grid-template-columns:repeat(12,1fr);gap:16px;">
-			<div style="grid-column:span 12;background:#fff;border:1px solid #c3c4c7;border-radius:10px;padding:16px;">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Embedding analysis (topic vs terms)', 'beeclear-content-analyzer' ); ?></h2>
-				<div id="ca-embedding-results"><em><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></em></div>
-			</div>
+		<script>
+		(function($){
+			'use strict';
+			function E(s){return String(s||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]})}
 
-			<div style="grid-column:span 12;background:#fff;border:1px solid #c3c4c7;border-radius:10px;padding:16px;">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Chunk analysis (topic vs paragraphs)', 'beeclear-content-analyzer' ); ?></h2>
-				<div id="ca-chunk-results"><em><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></em></div>
-			</div>
-		</div>
+			var POST_ID = <?php echo (int) $post_id; ?>;
+			var MODE = (window.bccaData && window.bccaData.mode) ? window.bccaData.mode : 'server';
+
+			var report = null;
+			var defaultTopic = '';
+			var topicSourceNote = '';
+
+			// ---------- Browser mode semantic vectors (feature hashing) ----------
+			function tok(s){
+				s=(s||'').toLowerCase();
+				return s.split(/[^0-9a-ząćęłńóśżź\-]+/i)
+					.map(function(x){return x.replace(/^\-+|\-+$/g,'');})
+					.filter(function(x){return x.length>=3;});
+			}
+			function hash32(str){
+				// FNV-1a
+				var h=0x811c9dc5;
+				for(var i=0;i<str.length;i++){
+					h ^= str.charCodeAt(i);
+					h = (h + ((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))) >>> 0;
+				}
+				return h>>>0;
+			}
+			function vectorize(text, dim){
+				dim = dim || 1024;
+				var v = new Array(dim);
+				for(var i=0;i<dim;i++) v[i]=0;
+				var t=(text||'').toLowerCase();
+
+				var w = tok(t);
+				for(var i=0;i<w.length;i++){
+					var term=w[i];
+					v[hash32('w:'+term)%dim] += 1;
+					if(i<w.length-1){
+						var bg = term+' '+w[i+1];
+						v[hash32('b:'+bg)%dim] += 0.35;
+					}
+				}
+				// char 4-grams
+				var s=t.replace(/\s+/g,' ');
+				for(var j=0;j<s.length-3;j++){
+					var g=s.substr(j,4);
+					if(g.trim().length<4) continue;
+					v[hash32('c:'+g)%dim] += 0.08;
+				}
+				return v;
+			}
+			function cos(a,b){
+				var dot=0,ma=0,mb=0,n=Math.min(a.length,b.length);
+				for(var i=0;i<n;i++){
+					var x=a[i]||0, y=b[i]||0;
+					dot+=x*y; ma+=x*x; mb+=y*y;
+				}
+				ma=Math.sqrt(ma); mb=Math.sqrt(mb);
+				if(!ma||!mb) return 0;
+				return dot/(ma*mb);
+			}
+			function browserWordAnalysis(text, phrase){
+				var dim=1024;
+				var topicVec = vectorize(phrase, dim);
+				var fullVec  = vectorize(text, dim);
+				var overall  = cos(topicVec, fullVec);
+
+				var words = tok(text);
+				var freq = {};
+				for(var i=0;i<words.length;i++){
+					freq[words[i]] = (freq[words[i]]||0)+1;
+				}
+				var entries = Object.keys(freq).map(function(k){return {w:k,c:freq[k]};});
+				entries.sort(function(a,b){return b.c-a.c;});
+				entries = entries.slice(0,600);
+
+				var pset = {};
+				tok(phrase).forEach(function(w){pset[w]=1;});
+
+				var out=[];
+				var win=5;
+				for(var ei=0;ei<entries.length;ei++){
+					var term=entries[ei].w;
+					var count=entries[ei].c;
+					var dm=pset[term]?1:0;
+
+					var ctx=[];
+					for(var i=0;i<words.length;i++){
+						if(words[i]!==term) continue;
+						for(var j=Math.max(0,i-win); j<=Math.min(words.length-1,i+win); j++){
+							if(j===i) continue;
+							ctx.push(words[j]);
+						}
+						if(ctx.length>200) break;
+					}
+					var ctxVec=vectorize(ctx.join(' '), dim);
+					var cs=cos(topicVec, ctxVec);
+					var score=Math.min(1,(dm*0.55)+(cs*0.45));
+
+					out.push({
+						word: term,
+						count: count,
+						direct_match: !!dm,
+						context_score: Math.round(cs*1000)/10,
+						relevance_score: Math.round(score*1000)/10
+					});
+				}
+				out.sort(function(a,b){return b.relevance_score-a.relevance_score;});
+
+				var hi=0,md=0,lo=0,sum=0;
+				for(var i=0;i<out.length;i++){
+					var rs=out[i].relevance_score;
+					sum+=rs;
+					if(rs>=40) hi++;
+					else if(rs>=15) md++;
+					else lo++;
+				}
+				var avg = out.length ? Math.round((sum/out.length)*10)/10 : 0;
+
+				return {
+					phrase: phrase,
+					overall_similarity: Math.round(overall*1000)/10,
+					total_unique_words: out.length,
+					high_relevance: hi,
+					medium_relevance: md,
+					low_relevance: lo,
+					average_relevance: avg,
+					words: out.slice(0,200)
+				};
+			}
+			function browserChunkAnalysis(chunks, phrase){
+				var dim=1024;
+				var topicVec=vectorize(phrase, dim);
+				var res=[];
+				for(var i=0;i<chunks.length;i++){
+					var ch=chunks[i];
+					var v=vectorize(ch.text||'', dim);
+					var s=cos(topicVec, v);
+					res.push({
+						index: ch.index,
+						text: ch.text,
+						word_count: ch.word_count,
+						similarity: s,
+						similarity_percent: Math.round(s*1000)/10
+					});
+				}
+				res.sort(function(a,b){return b.similarity-a.similarity;});
+				var sum=0, mx=0, mn=100;
+				for(var i=0;i<res.length;i++){
+					sum += res[i].similarity;
+					mx = Math.max(mx, res[i].similarity_percent);
+					mn = Math.min(mn, res[i].similarity_percent);
+				}
+				var avg = res.length ? (sum/res.length) : 0;
+				return {
+					phrase: phrase,
+					chunks: res.slice(0,120),
+					chunk_count: res.length,
+					average_similarity: Math.round(avg*10000)/10000,
+					average_percent: Math.round(avg*1000)/10,
+					max_percent: mx,
+					min_percent: (mn===100?0:mn)
+				};
+			}
+
+			function scoreClass(p){
+				if(p<15) return 'low';
+				if(p<30) return 'med';
+				if(p<50) return 'good';
+				return 'great';
+			}
+
+			function setLoading($el, msg){
+				$el.html('<div class="bcca-loading"><span class="spinner is-active" style="float:none;margin:0;"></span>'+E(msg)+'</div>');
+			}
+
+			function renderHeadingsSummary(h){
+				h = h||{h1:[],h2:[],h3:[],h4:[],h5:[],h6:[],total:0};
+				var counts = {
+					h1:(h.h1||[]).length, h2:(h.h2||[]).length, h3:(h.h3||[]).length,
+					h4:(h.h4||[]).length, h5:(h.h5||[]).length, h6:(h.h6||[]).length,
+					total: (h.total||0)
+				};
+				var html =
+					'<span class="bcca-badge">H1: <strong>'+counts.h1+'</strong></span>'+
+					'<span class="bcca-badge">H2: <strong>'+counts.h2+'</strong></span>'+
+					'<span class="bcca-badge">H3: <strong>'+counts.h3+'</strong></span>'+
+					'<span class="bcca-badge">H4: <strong>'+counts.h4+'</strong></span>'+
+					'<span class="bcca-badge">H5: <strong>'+counts.h5+'</strong></span>'+
+					'<span class="bcca-badge">H6: <strong>'+counts.h6+'</strong></span>'+
+					'<div class="bcca-muted">Total: <strong>'+counts.total+'</strong></div>';
+				$('#bcca-headings-summary').html(html);
+			}
+
+			function renderHeadingsStructure(h){
+				h = h||{h1:[],h2:[],h3:[],h4:[],h5:[],h6:[]};
+				var html='';
+				['h1','h2','h3','h4','h5','h6'].forEach(function(k){
+					var arr=h[k]||[];
+					if(arr.length){
+						html += '<div style="margin:6px 0;"><strong>'+k.toUpperCase()+'</strong>: '+arr.map(E).join(' | ')+'</div>';
+					}
+				});
+				if(!html) html='<span class="bcca-muted"><?php echo esc_js( __( 'No headings found.', 'beeclear-content-analyzer' ) ); ?></span>';
+				$('#bcca-headings-structure').html(html);
+			}
+
+			function renderKpis(r){
+				var $k=$('#bcca-kpis'); $k.empty();
+				$k.append('<span class="bcca-pill"><?php echo esc_js( __( 'Words', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(r.word_count)+'</strong></span>');
+				$k.append('<span class="bcca-pill"><?php echo esc_js( __( 'Chars', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(r.char_count)+'</strong></span>');
+				$k.append('<span class="bcca-pill"><?php echo esc_js( __( 'Paragraphs', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(r.paragraph_count)+'</strong></span>');
+				$k.append('<span class="bcca-pill"><?php echo esc_js( __( 'Published', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(String(r.date_published||'').slice(0,10))+'</strong></span>');
+				$k.append('<span class="bcca-pill"><?php echo esc_js( __( 'Updated', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(String(r.date_modified||'').slice(0,10))+'</strong></span>');
+			}
+
+			function fetchReport(){
+				setLoading($('#bcca-kpis'), '<?php echo esc_js( __( 'Loading report...', 'beeclear-content-analyzer' ) ); ?>');
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_get_post_report', nonce:window.bccaData.nonce, post_id:POST_ID}, function(resp){
+					if(resp && resp.success && resp.data){
+						report = resp.data;
+						$('#bcca-url').attr('href', report.url).text(report.url);
+						renderKpis(report);
+						renderHeadingsSummary(report.headings);
+						renderHeadingsStructure(report.headings);
+
+						defaultTopic = report.default_topic || '';
+						var metaTopic = (report.meta_topic||'').trim();
+
+						if(metaTopic){
+							topicSourceNote = '<?php echo esc_js( __( 'Source: metabox (manual)', 'beeclear-content-analyzer' ) ); ?>';
+						} else if(report.headings && report.headings.h1 && report.headings.h1.length){
+							topicSourceNote = '<?php echo esc_js( __( 'Source: first H1', 'beeclear-content-analyzer' ) ); ?>';
+						} else {
+							topicSourceNote = '<?php echo esc_js( __( 'Source: title', 'beeclear-content-analyzer' ) ); ?>';
+						}
+
+						$('#bcca-topic').val(defaultTopic);
+						$('#bcca-topic-note').text(topicSourceNote);
+
+						// Try show cache info if exists (non-blocking)
+						refreshCacheInfo();
+					} else {
+						$('#bcca-kpis').html('<span class="bcca-muted"><?php echo esc_js( __( 'Failed to load report.', 'beeclear-content-analyzer' ) ); ?></span>');
+					}
+				});
+			}
+
+			function getTopic(){ return ($('#bcca-topic').val()||'').trim(); }
+
+			function refreshCacheInfo(){
+				var phrase=getTopic();
+				if(!phrase){ $('#bcca-word-cacheinfo').text(''); $('#bcca-chunk-cacheinfo').text(''); return; }
+
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'word', phrase:phrase}, function(r){
+					if(r && r.success && r.data && r.data.found){
+						$('#bcca-word-cacheinfo').text('<?php echo esc_js( __( 'Cached at:', 'beeclear-content-analyzer' ) ); ?> '+r.data.created_at+' — '+(r.data.phrase||phrase));
+					} else {
+						$('#bcca-word-cacheinfo').text('<?php echo esc_js( __( 'No cache for this topic yet.', 'beeclear-content-analyzer' ) ); ?>');
+					}
+				});
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'chunk', phrase:phrase}, function(r){
+					if(r && r.success && r.data && r.data.found){
+						$('#bcca-chunk-cacheinfo').text('<?php echo esc_js( __( 'Cached at:', 'beeclear-content-analyzer' ) ); ?> '+r.data.created_at+' — '+(r.data.phrase||phrase));
+					} else {
+						$('#bcca-chunk-cacheinfo').text('<?php echo esc_js( __( 'No cache for this topic yet.', 'beeclear-content-analyzer' ) ); ?>');
+					}
+				});
+			}
+
+			function renderWordResult(payload, createdAt, cached){
+				var d = payload.data || payload; // allow direct data
+				var pct = d.overall_similarity || 0;
+				var cls = scoreClass(pct);
+				var html = '';
+				html += '<div class="bcca-score"><div class="bcca-circle '+cls+'">'+E(pct)+'%</div><div>';
+				html += '<div><strong><?php echo esc_js( __( 'Overall similarity', 'beeclear-content-analyzer' ) ); ?></strong></div>';
+				html += '<div class="bcca-muted"><?php echo esc_js( __( 'Unique words analyzed', 'beeclear-content-analyzer' ) ); ?>: '+E(d.total_unique_words||0)+
+					' | <?php echo esc_js( __( 'High', 'beeclear-content-analyzer' ) ); ?>: '+E(d.high_relevance||0)+
+					' | <?php echo esc_js( __( 'Medium', 'beeclear-content-analyzer' ) ); ?>: '+E(d.medium_relevance||0)+
+					' | <?php echo esc_js( __( 'Low', 'beeclear-content-analyzer' ) ); ?>: '+E(d.low_relevance||0)+
+					' | <?php echo esc_js( __( 'Avg', 'beeclear-content-analyzer' ) ); ?>: '+E(d.average_relevance||0)+'%</div>';
+				if(createdAt){
+					html += '<div class="bcca-muted">'+(cached?'<?php echo esc_js( __( 'Loaded from cache:', 'beeclear-content-analyzer' ) ); ?>':'<?php echo esc_js( __( 'Generated at:', 'beeclear-content-analyzer' ) ); ?>')+' '+E(createdAt)+'</div>';
+				}
+				html += '</div></div>';
+
+				var words = d.words || [];
+				if(!words.length){
+					html += '<div class="bcca-muted"><?php echo esc_js( __( 'No words to show.', 'beeclear-content-analyzer' ) ); ?></div>';
+					$('#bcca-word-results').html(html);
+					return;
+				}
+				html += '<table class="bcca-table"><thead><tr>'+
+					'<th><?php echo esc_js( __( 'Word', 'beeclear-content-analyzer' ) ); ?></th>'+
+					'<th><?php echo esc_js( __( 'Count', 'beeclear-content-analyzer' ) ); ?></th>'+
+					'<th><?php echo esc_js( __( 'Direct', 'beeclear-content-analyzer' ) ); ?></th>'+
+					'<th><?php echo esc_js( __( 'Context', 'beeclear-content-analyzer' ) ); ?></th>'+
+					'<th><?php echo esc_js( __( 'Relevance', 'beeclear-content-analyzer' ) ); ?></th>'+
+				'</tr></thead><tbody>';
+				words.forEach(function(w){
+					html += '<tr>'+
+						'<td>'+E(w.word)+'</td>'+
+						'<td>'+E(w.count)+'</td>'+
+						'<td>'+(w.direct_match?'<span class="bcca-badge"><?php echo esc_js( __( 'yes', 'beeclear-content-analyzer' ) ); ?></span>':'—')+'</td>'+
+						'<td>'+E(w.context_score)+'%</td>'+
+						'<td><strong>'+E(w.relevance_score)+'%</strong></td>'+
+					'</tr>';
+				});
+				html += '</tbody></table>';
+				$('#bcca-word-results').html(html);
+			}
+
+			function renderChunkResult(payload, createdAt, cached){
+				var d = payload.data || payload;
+				var html = '';
+				html += '<div class="bcca-muted"><?php echo esc_js( __( 'Chunks', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(d.chunk_count||0)+'</strong>'+
+					' | <?php echo esc_js( __( 'Average', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(d.average_percent||0)+'%</strong>'+
+					' | <?php echo esc_js( __( 'Max', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(d.max_percent||0)+'%</strong>'+
+					' | <?php echo esc_js( __( 'Min', 'beeclear-content-analyzer' ) ); ?>: <strong>'+E(d.min_percent||0)+'%</strong></div>';
+				if(createdAt){
+					html += '<div class="bcca-muted" style="margin-top:6px;">'+(cached?'<?php echo esc_js( __( 'Loaded from cache:', 'beeclear-content-analyzer' ) ); ?>':'<?php echo esc_js( __( 'Generated at:', 'beeclear-content-analyzer' ) ); ?>')+' '+E(createdAt)+'</div>';
+				}
+
+				var chunks = d.chunks || [];
+				if(!chunks.length){
+					html += '<div class="bcca-muted"><?php echo esc_js( __( 'No chunks to show.', 'beeclear-content-analyzer' ) ); ?></div>';
+					$('#bcca-chunk-results').html(html);
+					return;
+				}
+				html += '<table class="bcca-table"><thead><tr>'+
+					'<th>#</th><th><?php echo esc_js( __( 'Similarity', 'beeclear-content-analyzer' ) ); ?></th><th><?php echo esc_js( __( 'Words', 'beeclear-content-analyzer' ) ); ?></th><th><?php echo esc_js( __( 'Text', 'beeclear-content-analyzer' ) ); ?></th>'+
+				'</tr></thead><tbody>';
+				chunks.forEach(function(ch){
+					var txt = String(ch.text||'');
+					var short = txt.length>280 ? txt.slice(0,280)+'…' : txt;
+					html += '<tr>'+
+						'<td>'+E(ch.index)+'</td>'+
+						'<td><strong>'+E(ch.similarity_percent)+'%</strong></td>'+
+						'<td>'+E(ch.word_count)+'</td>'+
+						'<td>'+E(short)+'</td>'+
+					'</tr>';
+				});
+				html += '</tbody></table>';
+				$('#bcca-chunk-results').html(html);
+			}
+
+			function runWord(force){
+				var phrase=getTopic();
+				if(!phrase){ alert('<?php echo esc_js( __( 'Please set a topic first.', 'beeclear-content-analyzer' ) ); ?>'); return; }
+				setLoading($('#bcca-word-results'), '<?php echo esc_js( __( 'Analyzing...', 'beeclear-content-analyzer' ) ); ?>');
+
+				// Try cache first if not forcing
+				if(!force){
+					$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'word', phrase:phrase}, function(r){
+						if(r && r.success && r.data && r.data.found){
+							renderWordResult(r.data.data, r.data.created_at, true);
+							refreshCacheInfo();
+						} else {
+							runWordCompute(force);
+						}
+					});
+				} else {
+					runWordCompute(force);
+				}
+			}
+
+			function runWordCompute(force){
+				var phrase=getTopic();
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_run_word_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, phrase:phrase, force: force ? 1 : 0}, function(resp){
+					if(resp && resp.success && resp.data){
+						if(resp.data.mode==='browser'){
+							// compute in browser, then save cache
+							try{
+								var computed = browserWordAnalysis(resp.data.text||'', phrase);
+								renderWordResult(computed, new Date().toISOString().slice(0,19).replace('T',' '), false);
+
+								$.post(window.bccaData.ajaxUrl, {action:'bcca_save_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:'browser', analysis_type:'word', phrase:phrase, data: JSON.stringify(computed)}, function(){ refreshCacheInfo(); });
+							}catch(e){
+								$('#bcca-word-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
+							}
+						} else {
+							renderWordResult(resp.data.data, resp.data.created_at, !!resp.data.cached);
+							refreshCacheInfo();
+						}
+					} else {
+						$('#bcca-word-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
+					}
+				});
+			}
+
+			function runChunk(force){
+				var phrase=getTopic();
+				if(!phrase){ alert('<?php echo esc_js( __( 'Please set a topic first.', 'beeclear-content-analyzer' ) ); ?>'); return; }
+				setLoading($('#bcca-chunk-results'), '<?php echo esc_js( __( 'Analyzing...', 'beeclear-content-analyzer' ) ); ?>');
+
+				// Try cache first if not forcing
+				if(!force){
+					$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'chunk', phrase:phrase}, function(r){
+						if(r && r.success && r.data && r.data.found){
+							renderChunkResult(r.data.data, r.data.created_at, true);
+							refreshCacheInfo();
+						} else {
+							runChunkCompute(force);
+						}
+					});
+				} else {
+					runChunkCompute(force);
+				}
+			}
+
+			function runChunkCompute(force){
+				var phrase=getTopic();
+				$.post(window.bccaData.ajaxUrl, {action:'bcca_run_chunk_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, phrase:phrase, force: force ? 1 : 0}, function(resp){
+					if(resp && resp.success && resp.data){
+						if(resp.data.mode==='browser'){
+							try{
+								var computed = browserChunkAnalysis(resp.data.chunks||[], phrase);
+								renderChunkResult(computed, new Date().toISOString().slice(0,19).replace('T',' '), false);
+
+								$.post(window.bccaData.ajaxUrl, {action:'bcca_save_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:'browser', analysis_type:'chunk', phrase:phrase, data: JSON.stringify(computed)}, function(){ refreshCacheInfo(); });
+							}catch(e){
+								$('#bcca-chunk-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
+							}
+						} else {
+							renderChunkResult(resp.data.data, resp.data.created_at, !!resp.data.cached);
+							refreshCacheInfo();
+						}
+					} else {
+						$('#bcca-chunk-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
+					}
+				});
+			}
+
+			$(function(){
+				fetchReport();
+
+				$('#bcca-reset-topic').on('click', function(e){
+					e.preventDefault();
+					$('#bcca-topic').val(defaultTopic);
+					$('#bcca-topic-note').text(topicSourceNote);
+					refreshCacheInfo();
+				});
+				$('#bcca-topic').on('change keyup', function(){ refreshCacheInfo(); });
+
+				$('#bcca-run-word').on('click', function(e){ e.preventDefault(); runWord(false); });
+				$('#bcca-run-word-force').on('click', function(e){ e.preventDefault(); runWord(true); });
+
+				$('#bcca-run-chunk').on('click', function(e){ e.preventDefault(); runChunk(false); });
+				$('#bcca-run-chunk-force').on('click', function(e){ e.preventDefault(); runChunk(true); });
+			});
+
+		})(jQuery);
+		</script>
 
 	</div>
-
-	<script>
-	(function($){
-	'use strict';
-	function E(t){return String(t||'').replace(/[&<>"']/g,function(m){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'})[m]})}
-
-	var postId = <?php echo (int) $post_id; ?>;
-	var mode = (caData && caData.mode) ? caData.mode : 'server';
-
-	var postDetail = null;
-
-	// ============================================================
-	// Browser mode vectors (no external libs)
-	// ============================================================
-	function caTok(s){
-		s=(s||'').toLowerCase();
-		return s.split(/[^0-9a-ząćęłńóśżź\-]+/i).map(function(x){return x.replace(/^\-+|\-+$/g,'');}).filter(function(x){return x.length>=3;});
-	}
-	function caHash32(str){
-		var h=0x811c9dc5;
-		for(var i=0;i<str.length;i++){
-			h ^= str.charCodeAt(i);
-			h = (h + ((h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24))) >>> 0;
-		}
-		return h>>>0;
-	}
-	function caVectorize(text, dim){
-		dim=dim||1024;
-		var v=new Array(dim);
-		for(var i=0;i<dim;i++) v[i]=0;
-		var t=(text||'').toLowerCase();
-
-		var toks=caTok(t);
-		for(var i=0;i<toks.length;i++){
-			var w=toks[i];
-			v[caHash32('w:'+w)%dim]+=1;
-			if(i<toks.length-1){
-				var bg=w+' '+toks[i+1];
-				v[caHash32('b:'+bg)%dim]+=0.35;
-			}
-		}
-		var s=t.replace(/\s+/g,' ');
-		for(var j=0;j<s.length-3;j++){
-			var g=s.substr(j,4);
-			if(g.trim().length<4) continue;
-			v[caHash32('c:'+g)%dim]+=0.08;
-		}
-		return v;
-	}
-	function caCos(a,b){
-		var dot=0,ma=0,mb=0;
-		var n=Math.min(a.length,b.length);
-		for(var i=0;i<n;i++){var x=a[i]||0,y=b[i]||0;dot+=x*y;ma+=x*x;mb+=y*y;}
-		ma=Math.sqrt(ma);mb=Math.sqrt(mb);
-		if(!ma||!mb) return 0;
-		return dot/(ma*mb);
-	}
-
-	function caBrowserWordAnalysis(text, phrase){
-		var dim=1024;
-		var topicVec = caVectorize(phrase, dim);
-		var fullVec = caVectorize(text, dim);
-		var overall = caCos(topicVec, fullVec);
-
-		var words = caTok(text);
-		var freq = {};
-		for(var i=0;i<words.length;i++){ var w=words[i]; freq[w]=(freq[w]||0)+1; }
-		var entries = Object.keys(freq).map(function(k){return {w:k,c:freq[k]};});
-		entries.sort(function(a,b){return b.c-a.c;});
-		entries = entries.slice(0,600);
-
-		var pset={}; caTok(phrase).forEach(function(w){pset[w]=1;});
-
-		var out=[];
-		var win=5;
-		for(var ei=0;ei<entries.length;ei++){
-			var term=entries[ei].w, count=entries[ei].c;
-			var dm=pset[term]?1:0;
-
-			var ctx=[];
-			for(var i=0;i<words.length;i++){
-				if(words[i]!==term) continue;
-				for(var j=Math.max(0,i-win); j<=Math.min(words.length-1,i+win); j++){
-					if(j===i) continue;
-					ctx.push(words[j]);
-				}
-				if(ctx.length>200) break;
-			}
-
-			var ctxVec = caVectorize(ctx.join(' '), dim);
-			var cs = caCos(topicVec, ctxVec);
-			var score = Math.min(1,(dm*0.55)+(cs*0.45));
-
-			out.push({
-				word: term,
-				count: count,
-				direct_match: !!dm,
-				context_score: Math.round(cs*1000)/10,
-				relevance_score: Math.round(score*1000)/10
-			});
-		}
-
-		out.sort(function(a,b){return b.relevance_score-a.relevance_score;});
-		var hi=0,md=0,lo=0,sum=0;
-		for(var i=0;i<out.length;i++){
-			var rs=out[i].relevance_score; sum+=rs;
-			if(rs>=40)hi++; else if(rs>=15)md++; else lo++;
-		}
-		var avg = out.length ? Math.round((sum/out.length)*10)/10 : 0;
-
-		return {
-			mode: 'browser',
-			phrase: phrase,
-			overall_similarity: Math.round(overall*1000)/10,
-			total_unique_words: out.length,
-			high_relevance: hi,
-			medium_relevance: md,
-			low_relevance: lo,
-			average_relevance: avg,
-			words: out.slice(0,200)
-		};
-	}
-
-	function caBrowserChunkAnalysis(chunks, phrase){
-		var dim=1024;
-		var topicVec=caVectorize(phrase, dim);
-
-		var res=[];
-		for(var i=0;i<chunks.length;i++){
-			var ch=chunks[i];
-			var vec=caVectorize(ch.text||'', dim);
-			var sim=caCos(topicVec, vec);
-			res.push({
-				index: ch.index,
-				text: ch.text,
-				word_count: ch.word_count,
-				similarity: sim,
-				similarity_percent: Math.round(sim*1000)/10,
-				topic_terms_found: []
-			});
-		}
-		res.sort(function(a,b){return b.similarity-a.similarity;});
-
-		var sum=0,mx=0,mn=100;
-		for(var i=0;i<res.length;i++){
-			sum+=res[i].similarity;
-			mx=Math.max(mx,res[i].similarity_percent);
-			mn=Math.min(mn,res[i].similarity_percent);
-		}
-		var avg = res.length ? (sum/res.length) : 0;
-
-		return {
-			mode: 'browser',
-			phrase: phrase,
-			chunks: res,
-			chunk_count: res.length,
-			average_similarity: Math.round(avg*10000)/10000,
-			average_percent: Math.round(avg*1000)/10,
-			max_percent: mx,
-			min_percent: (mn===100?0:mn)
-		};
-	}
-
-	// ============================================================
-	// UI renderers
-	// ============================================================
-	function scoreClass(pct){
-		if(pct<15) return 'background:#d63638';
-		if(pct<30) return 'background:#dba617';
-		if(pct<50) return 'background:#2ea2cc';
-		return 'background:#1d9b4d';
-	}
-	function renderEmbed(d, createdAt){
-		var wrap=$('#ca-embedding-results');
-		if(!d){ wrap.html('<em><?php echo esc_js( __( 'No data.', 'beeclear-content-analyzer' ) ); ?></em>'); return; }
-
-		var pct = parseFloat(d.overall_similarity||0);
-		var badge = '<span style="display:inline-flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:50%;color:#fff;font-weight:800;'+scoreClass(pct)+'">'+E(pct)+'%</span>';
-		var meta = '<div style="color:#646970;font-size:12px;margin-top:4px;">'+
-			'<?php echo esc_js( __( 'Topic:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.phrase||'')+'</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Mode:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.mode||'')+'</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Generated:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(createdAt||'—')+'</strong>'+
-		'</div>';
-
-		var summary = '<div style="display:flex;gap:14px;align-items:center;margin:8px 0 12px 0;">'+badge+
-			'<div><div><strong><?php echo esc_js( __( 'Overall similarity', 'beeclear-content-analyzer' ) ); ?></strong></div>'+
-			'<div style="color:#50575e;font-size:12px;margin-top:2px;">'+
-			'<?php echo esc_js( __( 'Unique words:', 'beeclear-content-analyzer' ) ); ?> '+E(d.total_unique_words)+' &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'High:', 'beeclear-content-analyzer' ) ); ?> '+E(d.high_relevance)+' &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Medium:', 'beeclear-content-analyzer' ) ); ?> '+E(d.medium_relevance)+' &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Low:', 'beeclear-content-analyzer' ) ); ?> '+E(d.low_relevance)+' &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Avg:', 'beeclear-content-analyzer' ) ); ?> '+E(d.average_relevance)+'%'+
-			'</div>'+meta+'</div></div>';
-
-		var rows = (d.words||[]).map(function(w){
-			return '<tr>'+
-				'<td><strong>'+E(w.word)+'</strong></td>'+
-				'<td>'+E(w.count)+'</td>'+
-				'<td>'+(w.direct_match?'<span style="display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #72aee6;background:#e7f5ff;color:#135e96;font-weight:700;font-size:12px;">yes</span>':'—')+'</td>'+
-				'<td>'+E(w.context_score)+'%</td>'+
-				'<td><strong>'+E(w.relevance_score)+'%</strong></td>'+
-			'</tr>';
-		}).join('');
-
-		var table = '<table class="widefat striped" style="max-width:1000px;"><thead><tr>'+
-			'<th><?php echo esc_js( __( 'Term', 'beeclear-content-analyzer' ) ); ?></th>'+
-			'<th><?php echo esc_js( __( 'Count', 'beeclear-content-analyzer' ) ); ?></th>'+
-			'<th><?php echo esc_js( __( 'Direct', 'beeclear-content-analyzer' ) ); ?></th>'+
-			'<th><?php echo esc_js( __( 'Context', 'beeclear-content-analyzer' ) ); ?></th>'+
-			'<th><?php echo esc_js( __( 'Relevance', 'beeclear-content-analyzer' ) ); ?></th>'+
-		'</tr></thead><tbody>'+rows+'</tbody></table>';
-
-		wrap.html(summary + table);
-	}
-
-	function renderChunks(d, createdAt){
-		var wrap=$('#ca-chunk-results');
-		if(!d){ wrap.html('<em><?php echo esc_js( __( 'No data.', 'beeclear-content-analyzer' ) ); ?></em>'); return; }
-
-		var meta = '<div style="color:#646970;font-size:12px;margin:4px 0 10px 0;">'+
-			'<?php echo esc_js( __( 'Topic:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.phrase||'')+'</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Mode:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.mode||'')+'</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Generated:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(createdAt||'—')+'</strong>'+
-		'</div>';
-
-		var summary = '<div style="color:#50575e;margin:6px 0 10px 0;">'+
-			'<?php echo esc_js( __( 'Chunks:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.chunk_count)+'</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Average:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.average_percent)+'%</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Max:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.max_percent)+'%</strong> &nbsp;|&nbsp; '+
-			'<?php echo esc_js( __( 'Min:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(d.min_percent)+'%</strong>'+
-		'</div>';
-
-		var rows=(d.chunks||[]).slice(0,120).map(function(ch){
-			var pct = parseFloat(ch.similarity_percent||0);
-			var pill = '<span style="display:inline-block;min-width:62px;text-align:center;padding:2px 8px;border-radius:999px;color:#fff;font-weight:800;'+scoreClass(pct)+'">'+E(pct)+'%</span>';
-			return '<tr>'+
-				'<td>'+E(ch.index)+'</td>'+
-				'<td>'+pill+'</td>'+
-				'<td>'+E(ch.word_count)+'</td>'+
-				'<td>'+E(String(ch.text||'').slice(0,380))+(String(ch.text||'').length>380?'…':'')+'</td>'+
-			'</tr>';
-		}).join('');
-
-		var table = '<table class="widefat striped" style="max-width:1100px;"><thead><tr>'+
-			'<th>#</th><th><?php echo esc_js( __( 'Similarity', 'beeclear-content-analyzer' ) ); ?></th><th><?php echo esc_js( __( 'Words', 'beeclear-content-analyzer' ) ); ?></th><th><?php echo esc_js( __( 'Text', 'beeclear-content-analyzer' ) ); ?></th>'+
-		'</tr></thead><tbody>'+rows+'</tbody></table>';
-
-		wrap.html(meta + summary + table);
-	}
-
-	function setCachedLabel($el, createdAt){
-		$el.text(createdAt ? createdAt : '—');
-	}
-
-	function loadPostDetail(){
-		$('#ca-report-loading').show();
-		$.post(caData.ajaxUrl,{action:'ca_get_post_detail',nonce:caData.nonce,post_id:postId},function(r){
-			$('#ca-report-loading').hide();
-			if(!r || !r.success || !r.data){ return; }
-			postDetail=r.data;
-
-			// Set default topic
-			$('#ca-topic').val(postDetail.default_topic||'');
-			updateTopicHint();
-
-			// Show cache status for default topic
-			refreshCacheLabels();
-			loadCachedIfAny(); // show cached results immediately if available
-		});
-	}
-
-	function updateTopicHint(){
-		if(!postDetail){ return; }
-		var meta = (postDetail.focus_phrase_meta||'').trim();
-		var h1   = (postDetail.h1||'').trim();
-		var chosen = ($('#ca-topic').val()||'').trim();
-
-		var src = 'override';
-		if(chosen === meta && meta) src='meta box';
-		else if(chosen === h1 && h1) src='H1';
-		else if(chosen === (postDetail.title||'').trim()) src='title';
-
-		var hint = '<?php echo esc_js( __( 'Current topic source:', 'beeclear-content-analyzer' ) ); ?> <strong>'+E(src)+'</strong>';
-		if(meta){ hint += ' &nbsp;|&nbsp; <?php echo esc_js( __( 'Meta:', 'beeclear-content-analyzer' ) ); ?> '+E(meta); }
-		if(h1){ hint += ' &nbsp;|&nbsp; <?php echo esc_js( __( 'H1:', 'beeclear-content-analyzer' ) ); ?> '+E(h1); }
-		$('#ca-topic-hint').html(hint);
-	}
-
-	function refreshCacheLabels(){
-		var phrase = ($('#ca-topic').val()||'').trim();
-		if(!phrase){ return; }
-
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'embedding',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){ setCachedLabel($('#ca-embed-cached'), r.data.created_at); }
-			else { setCachedLabel($('#ca-embed-cached'), null); }
-		});
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'chunks',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){ setCachedLabel($('#ca-chunk-cached'), r.data.created_at); }
-			else { setCachedLabel($('#ca-chunk-cached'), null); }
-		});
-	}
-
-	function loadCachedIfAny(){
-		var phrase = ($('#ca-topic').val()||'').trim();
-		if(!phrase){ return; }
-
-		// Embedding cached
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'embedding',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){
-				renderEmbed(r.data.data, r.data.created_at);
-			}
-		});
-		// Chunks cached
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'chunks',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){
-				renderChunks(r.data.data, r.data.created_at);
-			}
-		});
-	}
-
-	function saveCache(type, phrase, data, cb){
-		$.post(caData.ajaxUrl,{
-			action:'ca_save_cached_analysis',
-			nonce:caData.nonce,
-			post_id:postId,
-			analysis_type:type,
-			phrase:phrase,
-			mode:mode,
-			analysis_data: JSON.stringify(data)
-		},function(r){
-			if(cb) cb(r && r.success);
-		});
-	}
-
-	function runEmbedding(){
-		var phrase = ($('#ca-topic').val()||'').trim();
-		if(!phrase){ alert('<?php echo esc_js( __( 'Please enter a topic.', 'beeclear-content-analyzer' ) ); ?>'); return; }
-
-		// Check cache first
-		$('#ca-embedding-results').html('<p><span class="spinner is-active" style="float:none;margin:0 8px 0 0;"></span><?php echo esc_js( __( 'Running analysis…', 'beeclear-content-analyzer' ) ); ?></p>');
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'embedding',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){
-				renderEmbed(r.data.data, r.data.created_at);
-				setCachedLabel($('#ca-embed-cached'), r.data.created_at);
-				return;
-			}
-
-			// Not cached: compute depending on mode
-			if(mode==='browser'){
-				try{
-					var text = caPlainTextFromDetail();
-					var computed = caBrowserWordAnalysis(text, phrase);
-					renderEmbed(computed, '<?php echo esc_js( current_time('mysql') ); ?>');
-					saveCache('embedding', phrase, computed, function(ok){ refreshCacheLabels(); });
-				}catch(e){
-					if(window.console && console.error) console.error(e);
-					$('#ca-embedding-results').html('<em><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></em>');
-				}
-			}else{
-				$.post(caData.ajaxUrl,{action:'ca_run_embedding_server',nonce:caData.nonce,post_id:postId,phrase:phrase},function(res){
-					if(res && res.success && res.data){
-						renderEmbed(res.data, '<?php echo esc_js( current_time('mysql') ); ?>');
-						saveCache('embedding', phrase, res.data, function(ok){ refreshCacheLabels(); });
-					}else{
-						$('#ca-embedding-results').html('<em><?php echo esc_js( __( 'Error.', 'beeclear-content-analyzer' ) ); ?></em>');
-					}
-				});
-			}
-		});
-	}
-
-	function runChunks(){
-		var phrase = ($('#ca-topic').val()||'').trim();
-		if(!phrase){ alert('<?php echo esc_js( __( 'Please enter a topic.', 'beeclear-content-analyzer' ) ); ?>'); return; }
-
-		$('#ca-chunk-results').html('<p><span class="spinner is-active" style="float:none;margin:0 8px 0 0;"></span><?php echo esc_js( __( 'Running analysis…', 'beeclear-content-analyzer' ) ); ?></p>');
-
-		$.post(caData.ajaxUrl,{action:'ca_get_cached_analysis',nonce:caData.nonce,post_id:postId,analysis_type:'chunks',phrase:phrase,mode:mode},function(r){
-			if(r && r.success && r.data && r.data.found){
-				renderChunks(r.data.data, r.data.created_at);
-				setCachedLabel($('#ca-chunk-cached'), r.data.created_at);
-				return;
-			}
-
-			if(mode==='browser'){
-				try{
-					var computed = caBrowserChunkAnalysis((postDetail && postDetail.chunks)?postDetail.chunks:[], phrase);
-					renderChunks(computed, '<?php echo esc_js( current_time('mysql') ); ?>');
-					saveCache('chunks', phrase, computed, function(ok){ refreshCacheLabels(); });
-				}catch(e){
-					if(window.console && console.error) console.error(e);
-					$('#ca-chunk-results').html('<em><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></em>');
-				}
-			}else{
-				$.post(caData.ajaxUrl,{action:'ca_run_chunks_server',nonce:caData.nonce,post_id:postId,phrase:phrase},function(res){
-					if(res && res.success && res.data){
-						renderChunks(res.data, '<?php echo esc_js( current_time('mysql') ); ?>');
-						saveCache('chunks', phrase, res.data, function(ok){ refreshCacheLabels(); });
-					}else{
-						$('#ca-chunk-results').html('<em><?php echo esc_js( __( 'Error.', 'beeclear-content-analyzer' ) ); ?></em>');
-					}
-				});
-			}
-		});
-	}
-
-	function caPlainTextFromDetail(){
-		// Prefer assembling from chunks (keeps it consistent with page content)
-		if(postDetail && postDetail.chunks && postDetail.chunks.length){
-			return postDetail.chunks.map(function(ch){return ch.text||'';}).join(' ');
-		}
-		// Fallback: title
-		return (postDetail && postDetail.title) ? postDetail.title : '';
-	}
-
-	function clearCache(){
-		if(!confirm('<?php echo esc_js( __( 'Clear all cached analyses for this post?', 'beeclear-content-analyzer' ) ); ?>')) return;
-		$.post(caData.ajaxUrl,{action:'ca_clear_post_cache',nonce:caData.nonce,post_id:postId},function(r){
-			refreshCacheLabels();
-			alert('<?php echo esc_js( __( 'Cache cleared.', 'beeclear-content-analyzer' ) ); ?>');
-		});
-	}
-
-	function useMeta(){
-		if(!postDetail) return;
-		if((postDetail.focus_phrase_meta||'').trim()===''){
-			alert('<?php echo esc_js( __( 'Meta box topic is empty.', 'beeclear-content-analyzer' ) ); ?>');
-			return;
-		}
-		$('#ca-topic').val((postDetail.focus_phrase_meta||'').trim());
-		updateTopicHint();
-		refreshCacheLabels();
-		loadCachedIfAny();
-	}
-
-	function useH1(){
-		if(!postDetail) return;
-		if((postDetail.h1||'').trim()===''){
-			alert('<?php echo esc_js( __( 'H1 not found.', 'beeclear-content-analyzer' ) ); ?>');
-			return;
-		}
-		$('#ca-topic').val((postDetail.h1||'').trim());
-		updateTopicHint();
-		refreshCacheLabels();
-		loadCachedIfAny();
-	}
-
-	$(document).ready(function(){
-		loadPostDetail();
-
-		$('#ca-topic').on('change keyup', function(){
-			updateTopicHint();
-			// do not spam cache calls on each keystroke; simple debounce
-			clearTimeout(window.__caTopicTimer);
-			window.__caTopicTimer = setTimeout(function(){
-				refreshCacheLabels();
-			}, 400);
-		});
-
-		$('#ca-run-embedding').on('click', function(e){ e.preventDefault(); runEmbedding(); });
-		$('#ca-run-chunks').on('click', function(e){ e.preventDefault(); runChunks(); });
-		$('#ca-clear-cache').on('click', function(e){ e.preventDefault(); clearCache(); });
-		$('#ca-use-meta').on('click', function(e){ e.preventDefault(); useMeta(); });
-		$('#ca-use-h1').on('click', function(e){ e.preventDefault(); useH1(); });
-	});
-
-	})(jQuery);
-	</script>
 	<?php
 }
