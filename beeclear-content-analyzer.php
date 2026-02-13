@@ -3,7 +3,7 @@
  * Plugin Name: BeeClear Content Analyzer
  * Plugin URI: https://beeclear.pl
  * Description: Content topicality analysis for WordPress posts and pages — server-side relevance + browser-side semantic vectors, with caching and reports.
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: <a href="https://beeclear.pl">BeeClear</a>
  * License: GPL v2 or later
  * Text Domain: beeclear-content-analyzer
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'BCCA_VERSION', '1.3.0' );
+define( 'BCCA_VERSION', '1.3.1' );
 
 /* ============================================================
    i18n
@@ -160,7 +160,6 @@ add_action( 'save_post', function ( $pid ) {
    Menus (Global settings first) + Import/Export + Report
    ============================================================ */
 add_action( 'admin_menu', function () {
-	// Menu label: without "BeeClear" -> "Content Analyzer" is OK for this plugin name
 	add_menu_page(
 		__( 'Content Analyzer', 'beeclear-content-analyzer' ),
 		__( 'Content Analyzer', 'beeclear-content-analyzer' ),
@@ -181,7 +180,7 @@ add_action( 'admin_menu', function () {
 		'bcca_render_global_settings_page'
 	);
 
-	// List (Analyzer)
+	// Analyzer list
 	add_submenu_page(
 		'bcca-content-analyzer',
 		__( 'Analyzer', 'beeclear-content-analyzer' ),
@@ -201,7 +200,7 @@ add_action( 'admin_menu', function () {
 		'bcca_render_import_export_page'
 	);
 
-	// Hidden report page (accessed via link)
+	// Hidden report page
 	add_submenu_page(
 		null,
 		__( 'Content report', 'beeclear-content-analyzer' ),
@@ -229,7 +228,7 @@ add_action( 'admin_enqueue_scripts', function ( $hook ) {
 		'bcca-content-analyzer_page_bcca-import-export',
 	);
 
-	// Report page hook varies; easiest: enqueue when page=bcca-report
+	// Report page
 	if ( isset( $_GET['page'] ) && $_GET['page'] === 'bcca-report' ) {
 		$allowed[] = $hook;
 	}
@@ -271,7 +270,6 @@ function bcca_render_global_settings_page() {
 	if ( isset( $_POST['bcca_clear_data'] ) ) {
 		check_admin_referer( 'bcca_clear_data', 'bcca_clear_nonce' );
 		bcca_clear_all_data();
-		// restore defaults so plugin continues to work
 		bcca_update_settings( bcca_defaults() );
 		$opts = bcca_get_settings();
 		echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__( 'Plugin data cleared.', 'beeclear-content-analyzer' ) . '</p></div>';
@@ -469,10 +467,7 @@ function bcca_extract_chunks( $html ) {
 }
 
 /* ============================================================
-   Topic selection rules:
-   - meta _ca_focus_phrase
-   - else first H1
-   - else post title
+   Topic selection rules
    ============================================================ */
 function bcca_default_topic_for_post( $post ) {
 	$meta = trim( (string) get_post_meta( $post->ID, '_ca_focus_phrase', true ) );
@@ -559,10 +554,9 @@ function bcca_cache_save( $post_id, $mode, $analysis_type, $phrase, $data ) {
 }
 
 /* ============================================================
-   Server-side "embedding-like" helpers (TF + context cosine)
+   Server-side analysis helpers
    ============================================================ */
 function bcca_stop_words() {
-	// minimal but useful stop list (PL+EN)
 	return array(
 		'i','w','na','z','do','nie','się','to','jest','że','o','jak','ale','za','co','od','po','tak','jej','jego',
 		'ten','ta','tym','tego','tej','tych','był','była','było','były','być','może','ich','go','mu','mi','ci','nam',
@@ -661,7 +655,6 @@ function bcca_context_vector( $all_words, $target, $window = 5 ) {
 			$ctx[ $w ]++;
 			$total++;
 		}
-		// hard cap for performance
 		if ( $total > 1500 ) {
 			break;
 		}
@@ -824,7 +817,7 @@ add_action( 'wp_ajax_bcca_get_cached_analysis', function () {
 } );
 
 /* ============================================================
-   AJAX: Cache save (used mainly for browser mode results)
+   AJAX: Cache save (browser results)
    ============================================================ */
 add_action( 'wp_ajax_bcca_save_cached_analysis', function () {
 	check_ajax_referer( 'bcca_nonce', 'nonce' );
@@ -875,7 +868,7 @@ add_action( 'wp_ajax_bcca_run_word_analysis', function () {
 	$opts = bcca_get_settings();
 	$mode = ( $opts['mode'] === 'browser' ) ? 'browser' : 'server';
 
-	// If browser mode -> return text payload, the browser will compute and then save cache via AJAX
+	// Browser mode -> return text payload
 	if ( $mode === 'browser' ) {
 		$text = bcca_plain_text_from_post( $post );
 		wp_send_json_success( array(
@@ -900,7 +893,6 @@ add_action( 'wp_ajax_bcca_run_word_analysis', function () {
 	}
 
 	$text = bcca_plain_text_from_post( $post );
-
 	$topic_vec = bcca_tf_vector( $phrase );
 
 	// lightweight bigram boost from phrase
@@ -914,7 +906,6 @@ add_action( 'wp_ajax_bcca_run_word_analysis', function () {
 			}
 		}
 	}
-
 	$topic_terms = array_keys( $topic_vec );
 
 	$lower = mb_strtolower( $text );
@@ -925,7 +916,6 @@ add_action( 'wp_ajax_bcca_run_word_analysis', function () {
 
 	$stop = bcca_stop_words();
 
-	// frequency map
 	$freq = array();
 	foreach ( $all_words as $w ) {
 		$w = trim( $w, '-' );
@@ -935,8 +925,6 @@ add_action( 'wp_ajax_bcca_run_word_analysis', function () {
 		$freq[ $w ] = ( $freq[ $w ] ?? 0 ) + 1;
 	}
 	arsort( $freq );
-
-	// limit terms for performance
 	$freq = array_slice( $freq, 0, 600, true );
 
 	$words_scored = array();
@@ -1017,7 +1005,7 @@ add_action( 'wp_ajax_bcca_run_chunk_analysis', function () {
 
 	$chunks = bcca_extract_chunks( $post->post_content );
 
-	// Browser mode: return chunks payload for client-side compute and cache save
+	// Browser mode: return chunks payload
 	if ( $mode === 'browser' ) {
 		wp_send_json_success( array(
 			'mode'   => 'browser',
@@ -1042,7 +1030,6 @@ add_action( 'wp_ajax_bcca_run_chunk_analysis', function () {
 
 	$topic = bcca_tf_vector( $phrase );
 
-	// bigram boost from phrase
 	$pl = mb_strtolower( $phrase );
 	$pw = preg_split( '/[^\p{L}\p{N}\-]+/u', $pl, -1, PREG_SPLIT_NO_EMPTY );
 	if ( is_array( $pw ) && count( $pw ) >= 2 ) {
@@ -1186,10 +1173,8 @@ function bcca_render_list_page() {
 				var k=sort.key, d=sort.dir;
 				rows.sort(function(a,b){
 					var x=valOf(a,k), y=valOf(b,k);
-					// strings
 					if(typeof x==='string'){ x=x.toLowerCase(); }
 					if(typeof y==='string'){ y=y.toLowerCase(); }
-					// numeric keys
 					if(k==='word_count'||k==='char_count'||k==='paragraph_count'||k==='headings_total'){
 						x=getNum(x); y=getNum(y);
 					}
@@ -1259,7 +1244,6 @@ function bcca_render_list_page() {
 					$('#bcca-loading').hide();
 					if(resp && resp.success && resp.data){
 						rows = resp.data.map(function(r){
-							// for sorting convenience
 							r.headings_total = (r.headings && r.headings.total) ? r.headings.total : 0;
 							return r;
 						});
@@ -1271,7 +1255,6 @@ function bcca_render_list_page() {
 			}
 
 			$(document).on('click','#bcca-table tbody tr', function(e){
-				// do not override clicks on links
 				if($(e.target).is('a') || $(e.target).closest('a').length){ return; }
 				var id = $(this).data('id');
 				if(id){ window.location.href = '<?php echo esc_js( admin_url( 'admin.php?page=bcca-report&post_id=' ) ); ?>'+id; }
@@ -1296,7 +1279,7 @@ function bcca_render_list_page() {
 }
 
 /* ============================================================
-   REPORT PAGE
+   REPORT PAGE (FULL WIDTH STACKED PANELS)
    ============================================================ */
 function bcca_render_report_page() {
 	if ( ! current_user_can( 'edit_posts' ) ) {
@@ -1319,19 +1302,16 @@ function bcca_render_report_page() {
 		</h1>
 
 		<p class="description">
-			<?php echo esc_html__( 'Analyses are cached per topic + mode. Change the topic to generate a new cache entry.', 'beeclear-content-analyzer' ); ?>
+			<?php echo esc_html__( 'Panels are full-width. Analyses are cached per topic + mode. Change the topic to generate a new cache entry.', 'beeclear-content-analyzer' ); ?>
 			<br/>
 			<?php echo esc_html__( 'Current mode:', 'beeclear-content-analyzer' ); ?>
 			<strong id="bcca-mode"><?php echo esc_html( $opts['mode'] ); ?></strong>
 		</p>
 
 		<style>
-			.bcca-grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px}
-			.bcca-card{grid-column:span 12;background:#fff;border:1px solid #c3c4c7;border-radius:10px;box-shadow:0 1px 1px rgba(0,0,0,.04);padding:14px 16px}
-			@media(min-width:1000px){ .span6{grid-column:span 6} .span4{grid-column:span 4} }
+			.bcca-panel{width:100%;background:#fff;border:1px solid #c3c4c7;border-radius:10px;box-shadow:0 1px 1px rgba(0,0,0,.04);padding:14px 16px;margin:14px 0}
 			.bcca-kpis{display:flex;flex-wrap:wrap;gap:8px}
 			.bcca-pill{background:#f6f7f7;border:1px solid #e0e0e0;border-radius:999px;padding:6px 10px;font-size:12px}
-			.bcca-pill strong{font-size:12px}
 			.bcca-badge{display:inline-flex;align-items:center;gap:6px;border:1px solid #e0e0e0;background:#f6f7f7;border-radius:999px;padding:2px 8px;font-size:12px;margin:2px 4px 2px 0}
 			.bcca-row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
 			.bcca-row input[type="text"]{min-width:320px;height:36px;padding:4px 8px;border:1px solid #8c8f94;border-radius:6px}
@@ -1349,66 +1329,63 @@ function bcca_render_report_page() {
 			.bcca-hr{border-top:1px solid #e0e0e0;margin:12px 0}
 		</style>
 
-		<div class="bcca-grid">
-			<div class="bcca-card span6">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Page details', 'beeclear-content-analyzer' ); ?></h2>
-				<div class="bcca-kpis" id="bcca-kpis">
-					<span class="bcca-pill"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></span>
-				</div>
-				<div class="bcca-hr"></div>
+		<div class="bcca-panel">
+			<h2 style="margin-top:0;"><?php echo esc_html__( 'Page details', 'beeclear-content-analyzer' ); ?></h2>
+			<div class="bcca-kpis" id="bcca-kpis">
+				<span class="bcca-pill"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></span>
+			</div>
+			<div class="bcca-hr"></div>
+			<div>
+				<div class="bcca-muted"><?php echo esc_html__( 'URL', 'beeclear-content-analyzer' ); ?></div>
+				<div><a id="bcca-url" href="<?php echo esc_url( get_permalink( $post_id ) ); ?>" target="_blank" rel="noopener"><?php echo esc_html( get_permalink( $post_id ) ); ?></a></div>
+			</div>
+			<div class="bcca-hr"></div>
+			<div class="bcca-muted"><?php echo esc_html__( 'Headings summary', 'beeclear-content-analyzer' ); ?></div>
+			<div id="bcca-headings-summary"></div>
+		</div>
+
+		<div class="bcca-panel">
+			<h2 style="margin-top:0;"><?php echo esc_html__( 'Topic & actions', 'beeclear-content-analyzer' ); ?></h2>
+
+			<div class="bcca-row">
 				<div>
-					<div class="bcca-muted"><?php echo esc_html__( 'URL', 'beeclear-content-analyzer' ); ?></div>
-					<div><a id="bcca-url" href="<?php echo esc_url( get_permalink( $post_id ) ); ?>" target="_blank" rel="noopener"><?php echo esc_html( get_permalink( $post_id ) ); ?></a></div>
+					<div class="bcca-muted"><?php echo esc_html__( 'Topic (from metabox / H1 / title)', 'beeclear-content-analyzer' ); ?></div>
+					<input type="text" id="bcca-topic" value="" />
+					<div class="bcca-muted" id="bcca-topic-note"></div>
 				</div>
-				<div class="bcca-hr"></div>
-				<div class="bcca-muted"><?php echo esc_html__( 'Headings summary', 'beeclear-content-analyzer' ); ?></div>
-				<div id="bcca-headings-summary"></div>
+				<button class="bcca-btn secondary" id="bcca-reset-topic"><span class="dashicons dashicons-update"></span><?php echo esc_html__( 'Reset to default', 'beeclear-content-analyzer' ); ?></button>
 			</div>
 
-			<div class="bcca-card span6">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Topic & actions', 'beeclear-content-analyzer' ); ?></h2>
+			<div class="bcca-hr"></div>
 
-				<div class="bcca-row">
-					<div>
-						<div class="bcca-muted"><?php echo esc_html__( 'Topic (from metabox / H1 / title)', 'beeclear-content-analyzer' ); ?></div>
-						<input type="text" id="bcca-topic" value="" />
-						<div class="bcca-muted" id="bcca-topic-note"></div>
-					</div>
-					<button class="bcca-btn secondary" id="bcca-reset-topic"><span class="dashicons dashicons-update"></span><?php echo esc_html__( 'Reset to default', 'beeclear-content-analyzer' ); ?></button>
-				</div>
-
-				<div class="bcca-hr"></div>
-
-				<div class="bcca-row">
-					<button class="bcca-btn" id="bcca-run-word"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run word analysis', 'beeclear-content-analyzer' ); ?></button>
-					<button class="bcca-btn secondary" id="bcca-run-word-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
-				</div>
-				<div class="bcca-muted" id="bcca-word-cacheinfo"></div>
-
-				<div class="bcca-hr"></div>
-
-				<div class="bcca-row">
-					<button class="bcca-btn" id="bcca-run-chunk"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run chunk analysis', 'beeclear-content-analyzer' ); ?></button>
-					<button class="bcca-btn secondary" id="bcca-run-chunk-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
-				</div>
-				<div class="bcca-muted" id="bcca-chunk-cacheinfo"></div>
-
+			<div class="bcca-row">
+				<button class="bcca-btn" id="bcca-run-word"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run word analysis', 'beeclear-content-analyzer' ); ?></button>
+				<button class="bcca-btn secondary" id="bcca-run-word-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
 			</div>
+			<div class="bcca-muted" id="bcca-word-cacheinfo"></div>
 
-			<div class="bcca-card span6">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Headings structure', 'beeclear-content-analyzer' ); ?></h2>
-				<div id="bcca-headings-structure" class="bcca-muted"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></div>
-			</div>
+			<div class="bcca-hr"></div>
 
-			<div class="bcca-card span6">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Word analysis results', 'beeclear-content-analyzer' ); ?></h2>
-				<div id="bcca-word-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
+			<div class="bcca-row">
+				<button class="bcca-btn" id="bcca-run-chunk"><span class="dashicons dashicons-search"></span><?php echo esc_html__( 'Run chunk analysis', 'beeclear-content-analyzer' ); ?></button>
+				<button class="bcca-btn secondary" id="bcca-run-chunk-force"><span class="dashicons dashicons-controls-repeat"></span><?php echo esc_html__( 'Re-run (ignore cache)', 'beeclear-content-analyzer' ); ?></button>
 			</div>
+			<div class="bcca-muted" id="bcca-chunk-cacheinfo"></div>
+		</div>
 
-			<div class="bcca-card">
-				<h2 style="margin-top:0;"><?php echo esc_html__( 'Chunk analysis results', 'beeclear-content-analyzer' ); ?></h2>
-				<div id="bcca-chunk-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
-			</div>
+		<div class="bcca-panel">
+			<h2 style="margin-top:0;"><?php echo esc_html__( 'Headings structure', 'beeclear-content-analyzer' ); ?></h2>
+			<div id="bcca-headings-structure" class="bcca-muted"><?php echo esc_html__( 'Loading...', 'beeclear-content-analyzer' ); ?></div>
+		</div>
+
+		<div class="bcca-panel">
+			<h2 style="margin-top:0;"><?php echo esc_html__( 'Word analysis results', 'beeclear-content-analyzer' ); ?></h2>
+			<div id="bcca-word-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
+		</div>
+
+		<div class="bcca-panel">
+			<h2 style="margin-top:0;"><?php echo esc_html__( 'Chunk analysis results', 'beeclear-content-analyzer' ); ?></h2>
+			<div id="bcca-chunk-results" class="bcca-muted"><?php echo esc_html__( 'Run analysis to see results.', 'beeclear-content-analyzer' ); ?></div>
 		</div>
 
 		<script>
@@ -1423,15 +1400,12 @@ function bcca_render_report_page() {
 			var defaultTopic = '';
 			var topicSourceNote = '';
 
-			// ---------- Browser mode semantic vectors (feature hashing) ----------
+			// Browser mode semantic vectors
 			function tok(s){
 				s=(s||'').toLowerCase();
-				return s.split(/[^0-9a-ząćęłńóśżź\-]+/i)
-					.map(function(x){return x.replace(/^\-+|\-+$/g,'');})
-					.filter(function(x){return x.length>=3;});
+				return s.split(/[^0-9a-ząćęłńóśżź\-]+/i).map(function(x){return x.replace(/^\-+|\-+$/g,'');}).filter(function(x){return x.length>=3;});
 			}
 			function hash32(str){
-				// FNV-1a
 				var h=0x811c9dc5;
 				for(var i=0;i<str.length;i++){
 					h ^= str.charCodeAt(i);
@@ -1444,7 +1418,6 @@ function bcca_render_report_page() {
 				var v = new Array(dim);
 				for(var i=0;i<dim;i++) v[i]=0;
 				var t=(text||'').toLowerCase();
-
 				var w = tok(t);
 				for(var i=0;i<w.length;i++){
 					var term=w[i];
@@ -1454,7 +1427,6 @@ function bcca_render_report_page() {
 						v[hash32('b:'+bg)%dim] += 0.35;
 					}
 				}
-				// char 4-grams
 				var s=t.replace(/\s+/g,' ');
 				for(var j=0;j<s.length-3;j++){
 					var g=s.substr(j,4);
@@ -1481,9 +1453,7 @@ function bcca_render_report_page() {
 
 				var words = tok(text);
 				var freq = {};
-				for(var i=0;i<words.length;i++){
-					freq[words[i]] = (freq[words[i]]||0)+1;
-				}
+				for(var i=0;i<words.length;i++){ freq[words[i]]=(freq[words[i]]||0)+1; }
 				var entries = Object.keys(freq).map(function(k){return {w:k,c:freq[k]};});
 				entries.sort(function(a,b){return b.c-a.c;});
 				entries = entries.slice(0,600);
@@ -1494,8 +1464,7 @@ function bcca_render_report_page() {
 				var out=[];
 				var win=5;
 				for(var ei=0;ei<entries.length;ei++){
-					var term=entries[ei].w;
-					var count=entries[ei].c;
+					var term=entries[ei].w, count=entries[ei].c;
 					var dm=pset[term]?1:0;
 
 					var ctx=[];
@@ -1523,11 +1492,8 @@ function bcca_render_report_page() {
 
 				var hi=0,md=0,lo=0,sum=0;
 				for(var i=0;i<out.length;i++){
-					var rs=out[i].relevance_score;
-					sum+=rs;
-					if(rs>=40) hi++;
-					else if(rs>=15) md++;
-					else lo++;
+					var rs=out[i].relevance_score; sum+=rs;
+					if(rs>=40) hi++; else if(rs>=15) md++; else lo++;
 				}
 				var avg = out.length ? Math.round((sum/out.length)*10)/10 : 0;
 
@@ -1652,7 +1618,6 @@ function bcca_render_report_page() {
 						$('#bcca-topic').val(defaultTopic);
 						$('#bcca-topic-note').text(topicSourceNote);
 
-						// Try show cache info if exists (non-blocking)
 						refreshCacheInfo();
 					} else {
 						$('#bcca-kpis').html('<span class="bcca-muted"><?php echo esc_js( __( 'Failed to load report.', 'beeclear-content-analyzer' ) ); ?></span>');
@@ -1683,7 +1648,7 @@ function bcca_render_report_page() {
 			}
 
 			function renderWordResult(payload, createdAt, cached){
-				var d = payload.data || payload; // allow direct data
+				var d = payload.data || payload;
 				var pct = d.overall_similarity || 0;
 				var cls = scoreClass(pct);
 				var html = '';
@@ -1764,7 +1729,6 @@ function bcca_render_report_page() {
 				if(!phrase){ alert('<?php echo esc_js( __( 'Please set a topic first.', 'beeclear-content-analyzer' ) ); ?>'); return; }
 				setLoading($('#bcca-word-results'), '<?php echo esc_js( __( 'Analyzing...', 'beeclear-content-analyzer' ) ); ?>');
 
-				// Try cache first if not forcing
 				if(!force){
 					$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'word', phrase:phrase}, function(r){
 						if(r && r.success && r.data && r.data.found){
@@ -1784,11 +1748,9 @@ function bcca_render_report_page() {
 				$.post(window.bccaData.ajaxUrl, {action:'bcca_run_word_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, phrase:phrase, force: force ? 1 : 0}, function(resp){
 					if(resp && resp.success && resp.data){
 						if(resp.data.mode==='browser'){
-							// compute in browser, then save cache
 							try{
 								var computed = browserWordAnalysis(resp.data.text||'', phrase);
 								renderWordResult(computed, new Date().toISOString().slice(0,19).replace('T',' '), false);
-
 								$.post(window.bccaData.ajaxUrl, {action:'bcca_save_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:'browser', analysis_type:'word', phrase:phrase, data: JSON.stringify(computed)}, function(){ refreshCacheInfo(); });
 							}catch(e){
 								$('#bcca-word-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
@@ -1808,7 +1770,6 @@ function bcca_render_report_page() {
 				if(!phrase){ alert('<?php echo esc_js( __( 'Please set a topic first.', 'beeclear-content-analyzer' ) ); ?>'); return; }
 				setLoading($('#bcca-chunk-results'), '<?php echo esc_js( __( 'Analyzing...', 'beeclear-content-analyzer' ) ); ?>');
 
-				// Try cache first if not forcing
 				if(!force){
 					$.post(window.bccaData.ajaxUrl, {action:'bcca_get_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:MODE, analysis_type:'chunk', phrase:phrase}, function(r){
 						if(r && r.success && r.data && r.data.found){
@@ -1831,7 +1792,6 @@ function bcca_render_report_page() {
 							try{
 								var computed = browserChunkAnalysis(resp.data.chunks||[], phrase);
 								renderChunkResult(computed, new Date().toISOString().slice(0,19).replace('T',' '), false);
-
 								$.post(window.bccaData.ajaxUrl, {action:'bcca_save_cached_analysis', nonce:window.bccaData.nonce, post_id:POST_ID, mode:'browser', analysis_type:'chunk', phrase:phrase, data: JSON.stringify(computed)}, function(){ refreshCacheInfo(); });
 							}catch(e){
 								$('#bcca-chunk-results').html('<div class="bcca-muted"><?php echo esc_js( __( 'Browser analysis failed.', 'beeclear-content-analyzer' ) ); ?></div>');
@@ -1863,7 +1823,6 @@ function bcca_render_report_page() {
 				$('#bcca-run-chunk').on('click', function(e){ e.preventDefault(); runChunk(false); });
 				$('#bcca-run-chunk-force').on('click', function(e){ e.preventDefault(); runChunk(true); });
 			});
-
 		})(jQuery);
 		</script>
 
