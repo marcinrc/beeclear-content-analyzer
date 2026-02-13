@@ -1,0 +1,44 @@
+name: Deploy to FTP (BC)
+
+on:
+  push:
+    branches:
+      - main
+      - bc
+
+jobs:
+  ftp-deploy:
+    name: FTP Deploy (BC)
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        server_dir:
+          - /public_html/wp-content/plugins/beeclear-content-analyzer/
+          - /public_html/demo/wp-content/plugins/beeclear-content-analyzer/
+          - /public_html/en/wp-content/plugins/beeclear-content-analyzer/
+          
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Upload to FTP (${{ matrix.server_dir }})
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.4
+        with:
+          server: ${{ secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftp
+          local-dir: ./
+          server-dir: ${{ matrix.server_dir }}
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/.github*
+            **/.github*/**
+            **/node_modules/**
+            **/*.md
+            **/README*
+            **/tests/**
+            **/.ftp-deploy-sync-state.json
